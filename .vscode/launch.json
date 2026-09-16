@@ -14,14 +14,14 @@
       "preLaunchTask": "build"
     },
     {
-      "name": "拡張を起動（vault のコピーを開く）",
+      "name": "拡張を起動（別フォルダを開く）",
       "type": "extensionHost",
       "request": "launch",
       "args": [
         "--new-window",
         "--disable-extensions",
         "--extensionDevelopmentPath=${workspaceFolder}",
-        "--folder-uri=file://${workspaceFolder}/../.."
+        "--folder-uri=file://${env:STATEFUL_AGENT_TARGET}"
       ],
       "outFiles": ["${workspaceFolder}/dist/**/*.js"],
       "preLaunchTask": "build"
