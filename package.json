@@ -87,6 +87,66 @@
           "type": "string",
           "default": "",
           "description": "フォルダ→OKF type 対応表(manifest)のパス。空なら .agent/manifest.yaml → vault設計/manifest.yaml の順に自動探索する"
+        },
+        "statefulAgent.contextBudget.isolateExploration": {
+          "type": "boolean",
+          "default": true,
+          "description": "[1] 調査の指示を explorer サブエージェントに隔離する。ツール出力がサブ側に留まり主スレッドには報告だけ返る（編集の指示では隔離しない）"
+        },
+        "statefulAgent.contextBudget.narrowInput": {
+          "type": "boolean",
+          "default": true,
+          "description": "[2] 大きいファイルの Read に範囲を足し、出力が膨らむ Bash に head を足す"
+        },
+        "statefulAgent.contextBudget.trimOutput": {
+          "type": "boolean",
+          "default": true,
+          "description": "[3] ツール出力がモデルに届く前に上限で中略する"
+        },
+        "statefulAgent.contextBudget.read.maxLines": {
+          "type": "number",
+          "default": 800,
+          "description": "[2] この行数を超える Read を範囲読みに落とす"
+        },
+        "statefulAgent.contextBudget.read.windowLines": {
+          "type": "number",
+          "default": 400,
+          "description": "[2] 範囲読みに落とすときの1回あたり行数"
+        },
+        "statefulAgent.contextBudget.read.maxBytes": {
+          "type": "number",
+          "default": 60000,
+          "description": "[2] このバイト数を超えるファイルは行数に関わらず範囲読みにする（1行が巨大なケース）"
+        },
+        "statefulAgent.contextBudget.bashOutputLines": {
+          "type": "number",
+          "default": 200,
+          "description": "[2] 出力が膨らむ Bash コマンドに足す head の行数"
+        },
+        "statefulAgent.contextBudget.output.read": {
+          "type": "number",
+          "default": 4000,
+          "description": "[3] Read / NotebookRead の出力上限（文字）"
+        },
+        "statefulAgent.contextBudget.output.bash": {
+          "type": "number",
+          "default": 3000,
+          "description": "[3] Bash / BashOutput の出力上限（文字）"
+        },
+        "statefulAgent.contextBudget.output.search": {
+          "type": "number",
+          "default": 2000,
+          "description": "[3] Grep / Glob の出力上限（文字）"
+        },
+        "statefulAgent.contextBudget.output.other": {
+          "type": "number",
+          "default": 3000,
+          "description": "[3] その他ツールの出力上限（文字）"
+        },
+        "statefulAgent.contextBudget.output.turnTotal": {
+          "type": "number",
+          "default": 40000,
+          "description": "[3] 1ターンのツール出力合計の上限（文字）。超えると以降を強く絞る"
         }
       }
     }

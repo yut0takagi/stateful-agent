@@ -19,6 +19,8 @@ import {
   type AgentState,
   type HistoryMode,
 } from "./state.js";
+import { ContextBudget } from "./contextbudget.js";
+import { DELEGATE_HINT, toAgentsOption } from "./explorer.js";
 
 /**
  * SDK は ESM 専用だが VSCode 拡張は CommonJS で動く。
@@ -54,6 +56,11 @@ export interface RunOptions {
   onToolUse?: (id: string, name: string, input: Record<string, unknown>) => void;
   /** ツール結果を受け取る。 */
   onToolResult?: (id: string, content: string, isError: boolean) => void;
+  /**
+   * context 予算。3層（隔離 / 入力を絞る / 出力を削る）を束ねたもの。
+   * 省略すると全層なしで従来どおり動く。ターンごとに作り直す。
+   */
+  budget?: ContextBudget;
 }
 
 export interface RunResult {
@@ -65,6 +72,8 @@ export interface RunResult {
   rateLimit?: unknown;
   /** state が引き継ぎ書として成立していない点。保存は通したうえで人に見せる。 */
   stateWarnings: string[];
+  /** どの層が何を削ったか。人に見せて閾値を動かす材料にする。 */
+  budgetSummary?: string;
 }
 
 /**
@@ -211,6 +220,37 @@ export interface SdkOptionInput {
   sessionId?: string;
   canUseTool?: RunOptions["canUseTool"];
   abortController?: AbortController;
+  /** context 予算。渡すと PostToolUse で出力を削り、隔離時は agents を載せる。 */
+  budget?: ContextBudget;
+  /** 調査を隔離するターンか。agents を載せるかの判断に使う。 */
+  isolating?: boolean;
+}
+
+/**
+ * ツール出力を削る PostToolUse フックを組み立てる。
+ *
+ * `updatedToolOutput` は「Replaces the tool output before it is sent to the model」。
+ * 削る必要がないときは hookSpecificOutput を返さない — 恒等の差し替えは
+ * 並行して走る他フックの差し替えと last-write-wins で競合し、
+ * 本物の削減を打ち消しうる（SDK の型注記が明示している）。
+ */
+export function buildPostToolUseHook(budget: ContextBudget) {
+  return async (input: unknown): Promise<Record<string, unknown>> => {
+    const i = input as { tool_name?: string; tool_response?: unknown };
+    if (typeof i.tool_name !== "string") {
+      return {};
+    }
+    const replaced = budget.applyOutput(i.tool_name, i.tool_response);
+    if (replaced === null) {
+      return {};
+    }
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PostToolUse",
+        updatedToolOutput: replaced,
+      },
+    };
+  };
 }
 
 /**
@@ -222,6 +262,12 @@ export interface SdkOptionInput {
 export function buildSdkOptions(input: SdkOptionInput): Record<string, unknown> {
   return {
     cwd: input.cwd,
+    // [3] 出力を削る。モデルに届く前に差し替える。
+    ...(input.budget
+      ? { hooks: { PostToolUse: [{ hooks: [buildPostToolUseHook(input.budget)] }] } }
+      : {}),
+    // [1] 隔離。調査のターンだけ explorer を載せる。
+    ...(input.isolating ? { agents: toAgentsOption() } : {}),
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
@@ -324,7 +370,11 @@ export function extractUsage(
 /** SDK を1ターン実行する。 */
 export async function run(opts: RunOptions): Promise<RunResult> {
   const recent = selectHistory(opts.mode, opts.history, opts.recentTurns);
-  const prompt = buildPrompt(opts.state, opts.instruction, recent);
+  // [1] 調査なら explorer に投げるよう主スレッドに伝える。
+  // agents を定義しただけでは使われない。
+  const isolating = opts.budget?.planIsolation(opts.instruction) ?? false;
+  const prompt =
+    buildPrompt(opts.state, opts.instruction, recent) + (isolating ? DELEGATE_HINT : "");
 
   const sdkOptions = buildSdkOptions({
     cwd: opts.cwd,
@@ -332,6 +382,8 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     sessionId: opts.sessionId,
     canUseTool: opts.canUseTool,
     abortController: opts.abortController,
+    budget: opts.budget,
+    isolating,
   });
 
   let response = "";
@@ -410,6 +462,7 @@ export async function run(opts: RunOptions): Promise<RunResult> {
   }
 
   const patched = processPatch(opts.state, response);
+  const summary = opts.budget?.summary();
 
   return {
     response,
@@ -418,5 +471,6 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     usage,
     rateLimit,
     stateWarnings: patched.warnings,
+    ...(summary !== null && summary !== undefined ? { budgetSummary: summary } : {}),
   };
 }

@@ -11,11 +11,18 @@
  * 使い方:
  *   node dist/bench.js --repo <対象リポジトリ> --turns 12
  *   node dist/bench.js --repo ~/Develop/devtch --turns 30 --modes recent,stateless
+ *
+ * context 予算の効き幅を分離して測る（1層ずつ足す）:
+ *   node dist/bench.mjs --repo <対象> --turns 12 --modes recent
+ *   node dist/bench.mjs --repo <対象> --turns 12 --modes recent --layers narrow
+ *   node dist/bench.mjs --repo <対象> --turns 12 --modes recent --layers narrow,trim
+ *   node dist/bench.mjs --repo <対象> --turns 12 --modes recent --layers all
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { run, type Turn } from "../core/agent.js";
+import { ContextBudget, DEFAULT_CONFIG } from "../core/contextbudget.js";
 import { INITIAL_STATE, parseState, serializeState, type AgentState, type HistoryMode } from "../core/state.js";
 import {
   buildComparison,
@@ -33,6 +40,11 @@ interface Options {
   scenario: string;
   outDir: string;
   recentTurns: number;
+  /**
+   * 有効にする context 予算の層。`--layers isolate,narrow,trim`。
+   * 既定は無し（従来どおり）。層を足しながら回して効き幅を分離して測る。
+   */
+  layers: { isolate: boolean; narrowInput: boolean; trimOutput: boolean } | null;
 }
 
 function parseArgs(argv: string[]): Options {
@@ -56,6 +68,28 @@ function parseArgs(argv: string[]): Options {
     scenario: get("scenario", join(dirname(process.argv[1] ?? "."), "default.txt")),
     outDir: get("out", ".bench"),
     recentTurns: Number(get("recent-turns", "3")),
+    layers: parseLayers(get("layers", "")),
+  };
+}
+
+/**
+ * `--layers` を解釈する。空なら null（層なし）。
+ *
+ * 層を個別に指定できるようにするのは、3層を一度に入れると
+ * どれが効いたのか分離できないため。1層ずつ足して測る。
+ */
+function parseLayers(
+  raw: string,
+): { isolate: boolean; narrowInput: boolean; trimOutput: boolean } | null {
+  if (raw.trim() === "") {
+    return null;
+  }
+  const names = raw.split(",").map((x) => x.trim());
+  const all = names.includes("all");
+  return {
+    isolate: all || names.includes("isolate"),
+    narrowInput: all || names.includes("narrow"),
+    trimOutput: all || names.includes("trim"),
   };
 }
 
@@ -97,7 +131,20 @@ async function main(): Promise<void> {
 
   console.log(`対象: ${opts.repo}`);
   console.log(`シナリオ: ${scenario.prompts.length} 問を巡回`);
-  console.log(`モード: ${opts.modes.join(" / ")} × ${opts.turns} ターン\n`);
+  console.log(`モード: ${opts.modes.join(" / ")} × ${opts.turns} ターン`);
+  console.log(
+    `context 予算: ${
+      opts.layers === null
+        ? "なし"
+        : [
+            opts.layers.isolate ? "隔離" : null,
+            opts.layers.narrowInput ? "入力を絞る" : null,
+            opts.layers.trimOutput ? "出力を削る" : null,
+          ]
+            .filter((x) => x !== null)
+            .join(" + ") || "なし"
+    }\n`,
+  );
 
   const results: BenchTurn[] = [];
   const logPath = join(opts.outDir, "turns.jsonl");
@@ -128,6 +175,11 @@ async function main(): Promise<void> {
       // そのターンで何をしたかを残す。トークン数だけでは
       // 「なぜ重かったか」を説明できない。
       const calls: ToolCall[] = [];
+      // ターンごとに作り直す。持ち回すと予算が枯れたまま次ターンに入る。
+      const budget =
+        opts.layers === null
+          ? undefined
+          : new ContextBudget({ ...DEFAULT_CONFIG, layers: opts.layers });
 
       let result;
       try {
@@ -140,6 +192,7 @@ async function main(): Promise<void> {
           // 対象リポジトリで動かす。読むファイルを揃えないと比較にならない。
           cwd: opts.repo,
           sessionId,
+          budget,
           onToolUse: (_id, name, input) => {
             calls.push({ name, input });
           },
