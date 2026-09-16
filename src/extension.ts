@@ -42,6 +42,7 @@ import { buildRunRecord, formatRunLine, parseRunLog, summarize } from "./core/me
 import { buildGraph, layoutGraph, toRenderModel } from "./core/graph.js";
 import { SendQueue } from "./core/queue.js";
 import { renderBashResult, summarizeToolUse } from "./core/toolview.js";
+import { ContextBudget, DEFAULT_CONFIG, type ContextBudgetConfig } from "./core/contextbudget.js";
 import { evaluate, type EngineDeps } from "./rules/engine.js";
 import {
   loadRules,
@@ -214,8 +215,52 @@ function loadRuleSet(root: string): RuleSet {
   });
 }
 
+/**
+ * ファイルの行数とバイト数を数える。
+ *
+ * 読めなければ null を返し、呼び出し側は「触らない」を選ぶ。
+ * 推測で範囲を付けると短いファイルの後半を理由なく隠すことになる。
+ */
+function fileFacts(root: string, path: string): { lines: number | null; bytes: number | null } {
+  const abs = path.startsWith("/") ? path : join(root, path);
+  try {
+    const bytes = statSync(abs).size;
+    // 巨大ファイルを行数のために全読みしたら本末転倒。
+    if (bytes > 2_000_000) {
+      return { lines: null, bytes };
+    }
+    return { lines: readFileSync(abs, "utf8").split("\n").length, bytes };
+  } catch {
+    return { lines: null, bytes: null };
+  }
+}
+
+/** 設定から context 予算の構成を読む。 */
+function budgetConfig(): ContextBudgetConfig {
+  return {
+    layers: {
+      isolate: config("contextBudget.isolateExploration", true),
+      narrowInput: config("contextBudget.narrowInput", true),
+      trimOutput: config("contextBudget.trimOutput", true),
+    },
+    read: {
+      maxLines: config("contextBudget.read.maxLines", DEFAULT_CONFIG.read.maxLines),
+      windowLines: config("contextBudget.read.windowLines", DEFAULT_CONFIG.read.windowLines),
+      maxBytes: config("contextBudget.read.maxBytes", DEFAULT_CONFIG.read.maxBytes),
+    },
+    output: {
+      read: config("contextBudget.output.read", DEFAULT_CONFIG.output.read),
+      bash: config("contextBudget.output.bash", DEFAULT_CONFIG.output.bash),
+      search: config("contextBudget.output.search", DEFAULT_CONFIG.output.search),
+      other: config("contextBudget.output.other", DEFAULT_CONFIG.output.other),
+      turnTotal: config("contextBudget.output.turnTotal", DEFAULT_CONFIG.output.turnTotal),
+    },
+    bashOutputLines: config("contextBudget.bashOutputLines", DEFAULT_CONFIG.bashOutputLines),
+  };
+}
+
 /** 規律エンジンを SDK の canUseTool に橋渡しする。 */
-function makeCanUseTool(root: string) {
+function makeCanUseTool(root: string, budget: ContextBudget) {
   const ruleSet = loadRuleSet(root);
   const deps = buildEngineDeps(root);
 
@@ -248,6 +293,9 @@ function makeCanUseTool(root: string) {
       return { behavior: "allow" as const, updatedInput: input };
     }
 
+    // 規律を通った入力を土台に、[2] 入力を絞る。
+    // 規律（deny/ask）が先。コスト削減が安全側の判断を上書きしてはいけない。
+    let allowed = input;
     if (decision.updatedInput) {
       post({ type: "rule", mark: "✎", text: `${decision.appliedRules.join(", ")} が入力を補正` });
       // 絶対パスに戻して返す
@@ -257,10 +305,16 @@ function makeCanUseTool(root: string) {
           restored[key] = input[key];
         }
       }
-      return { behavior: "allow" as const, updatedInput: restored };
+      allowed = restored;
     }
 
-    return { behavior: "allow" as const, updatedInput: input };
+    const narrowed = budget.planInput(toolName, allowed, (p) => fileFacts(root, p));
+    if (narrowed) {
+      post({ type: "rule", mark: "◧", text: narrowed.reason });
+      return { behavior: "allow" as const, updatedInput: narrowed.updatedInput };
+    }
+
+    return { behavior: "allow" as const, updatedInput: allowed };
   };
 }
 
@@ -364,6 +418,11 @@ async function handleSend(text: string): Promise<void> {
   // ターンごとに作り直す。前のターンの抑止状態を持ち越さない。
   const streamFilter = new StreamFilter();
 
+  // context 予算。3層（隔離 / 入力を絞る / 出力を削る）を1つの会計で束ねる。
+  // ターンごとに作り直す（持ち回すと予算が枯れたまま次ターンに入る）。
+  // canUseTool と run の両方が同じインスタンスを見るので、層をまたいだ実績が揃う。
+  const budget = new ContextBudget(budgetConfig());
+
   // 走っている間だけ保持する。stop メッセージでこれを abort する。
   const controller = new AbortController();
   running = controller;
@@ -378,7 +437,8 @@ async function handleSend(text: string): Promise<void> {
       cwd: root,
       sessionId,
       abortController: controller,
-      canUseTool: makeCanUseTool(root) as never,
+      budget,
+      canUseTool: makeCanUseTool(root, budget) as never,
       onText: (chunk) => {
         // state フェンスは機械が読むもの。人が読む本文には出さない。
         const visible = streamFilter.push(chunk);
@@ -459,6 +519,12 @@ async function handleSend(text: string): Promise<void> {
         type: "meta",
         text: `[${mode}] in ${inputTokens.toLocaleString()} / out ${outputTokens.toLocaleString()}${cache} tokens`,
       });
+    }
+
+    // どの層が何を削ったかを見せる。効き目が見えないと閾値を動かせない
+    // （既定値は仮置きなので人が調整する前提）。
+    if (result.budgetSummary) {
+      post({ type: "meta", text: result.budgetSummary });
     }
 
     // パッチが返らなかったターンを見せる。据え置きが無音だと取りこぼしに気づけない。

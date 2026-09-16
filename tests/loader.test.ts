@@ -11,6 +11,12 @@ import {
 
 const VAULT = resolve(__dirname, "../../..");
 
+// vault の実ファイルに当てる検証は、拡張を vault から切り出した単独リポジトリでは
+// 対象が無いのでスキップする。vault 内では従来どおり全件走る。
+const manifestPath = resolve(VAULT, "vault設計/manifest.yaml");
+const hasVaultManifest = existsSync(manifestPath);
+const hasVaultRules = existsSync(resolve(VAULT, ".agent/rules/vault.yaml"));
+
 function realDeps(): LoaderDeps {
   return {
     readFile: (p) => {
@@ -25,7 +31,7 @@ function realDeps(): LoaderDeps {
 }
 
 describe("loadRules", () => {
-  it("実際の vault.yaml を読める", () => {
+  it.skipIf(!hasVaultRules)("実際の vault.yaml を読める", () => {
     const rs = loadRules(resolve(VAULT, ".agent/rules"), realDeps());
     expect(rs.rules.length).toBeGreaterThanOrEqual(6);
     expect(rs.rules.map((r) => r.id)).toContain("okf-type-required");
@@ -51,15 +57,12 @@ describe("loadRules", () => {
   });
 });
 
-// vault の実ファイルに当てる検証。拡張を vault から切り出した単独リポジトリでは
-// manifest が無いのでスキップする（describe の本体で読むとファイル全体が落ちるため、
-// 存在を先に確かめる）。vault 内では従来どおり全件走る。
-const manifestPath = resolve(VAULT, "vault設計/manifest.yaml");
-const hasVaultManifest = existsSync(manifestPath);
+// describe.skipIf は body を評価してテストだけを skip するので、
+// manifest の読み込みを body に置くと skip 時でも ENOENT で落ちる。
+// 対象が無いときは空の対応表にしておき、テスト側が skip される形にする。
+const typeMap = hasVaultManifest ? loadTypeMap(readFileSync(manifestPath, "utf8")) : [];
 
 describe.skipIf(!hasVaultManifest)("loadTypeMap（manifest.yaml が正）", () => {
-  const manifest = readFileSync(manifestPath, "utf8");
-  const typeMap = loadTypeMap(manifest);
 
   it("実際の manifest から対応表を取れる", () => {
     expect(typeMap.length).toBeGreaterThan(5);
