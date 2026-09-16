@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * VSCode のテーマ変数から中間トークンを作る。
+ * Tailwind 側はこれを参照するので、テーマを変えても色が破綻しない。
+ */
+:root {
+  --hairline: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+  --surface: color-mix(in srgb, var(--vscode-foreground) 4%, transparent);
+  --muted-fg: color-mix(in srgb, var(--vscode-foreground) 55%, transparent);
+  /* 差分の追加/削除色。Tailwind の透明度修飾子を効かせるため rgb 成分で持つ。 */
+  --add-rgb: 63 185 80;
+  --del-rgb: 248 81 73;
+}
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--vscode-foreground);
+  background: var(--vscode-sideBar-background, transparent);
+}
+
+/* Webview のスクロールバーは VSCode 風に細く */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-track { background: transparent; }
+
+/*
+ * 枠なしで使う入力欄。
+ *
+ * VSCode の Webview は textarea/input に既定スタイルを当てており、
+ * --vscode-focusBorder のオレンジの線が **border** として内側に出る。
+ * Tailwind の outline-none では消えない（outline ではなく border だから）。
+ *
+ * 全 textarea に効かせると state インスペクタの編集枠まで消えるので、
+ * このクラスを付けた要素だけに限る。
+ */
+.no-frame,
+.no-frame:focus,
+.no-frame:focus-visible {
+  border: none;
+  outline: none;
+  box-shadow: none;
+}
