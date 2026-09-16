@@ -378,6 +378,8 @@ async function handleSend(text: string): Promise<void> {
       cwd: root,
       sessionId,
       abortController: controller,
+      // 調査の指示を explorer に隔離する。ツール出力が主コンテキストに入らない。
+      isolateExploration: config("isolateExploration", true),
       canUseTool: makeCanUseTool(root) as never,
       onText: (chunk) => {
         // state フェンスは機械が読むもの。人が読む本文には出さない。
@@ -459,6 +461,11 @@ async function handleSend(text: string): Promise<void> {
         type: "meta",
         text: `[${mode}] in ${inputTokens.toLocaleString()} / out ${outputTokens.toLocaleString()}${cache} tokens`,
       });
+    }
+
+    // 調査を隔離したターンを見せる。効き目が見えないと閾値を動かせない。
+    if (result.delegated) {
+      post({ type: "rule", mark: "◇", text: "調査を explorer に委譲（出力は主文脈に入らない）" });
     }
 
     // パッチが返らなかったターンを見せる。据え置きが無音だと取りこぼしに気づけない。

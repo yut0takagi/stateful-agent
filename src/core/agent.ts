@@ -19,6 +19,7 @@ import {
   type AgentState,
   type HistoryMode,
 } from "./state.js";
+import { DELEGATE_HINT, shouldDelegate, toAgentsOption } from "./explorer.js";
 
 /**
  * SDK は ESM 専用だが VSCode 拡張は CommonJS で動く。
@@ -54,6 +55,11 @@ export interface RunOptions {
   onToolUse?: (id: string, name: string, input: Record<string, unknown>) => void;
   /** ツール結果を受け取る。 */
   onToolResult?: (id: string, content: string, isError: boolean) => void;
+  /**
+   * 調査の指示を explorer サブエージェントに隔離する。
+   * 判定は shouldDelegate に任せ、編集の指示では隔離しない。
+   */
+  isolateExploration?: boolean;
 }
 
 export interface RunResult {
@@ -65,6 +71,8 @@ export interface RunResult {
   rateLimit?: unknown;
   /** state が引き継ぎ書として成立していない点。保存は通したうえで人に見せる。 */
   stateWarnings: string[];
+  /** 調査を explorer に委譲する指示だったか。UI に出して効き目を見る。 */
+  delegated?: boolean;
 }
 
 /**
@@ -211,6 +219,11 @@ export interface SdkOptionInput {
   sessionId?: string;
   canUseTool?: RunOptions["canUseTool"];
   abortController?: AbortController;
+  /**
+   * 調査を explorer サブエージェントに隔離する。
+   * 省略すると従来どおり主スレッドが自分で読む（既存の挙動を変えない）。
+   */
+  isolateExploration?: boolean;
 }
 
 /**
@@ -235,6 +248,8 @@ export function buildSdkOptions(input: SdkOptionInput): Record<string, unknown> 
     },
     // これが無いと assistant メッセージが完成後に一括で届く（= 画面が固まる）。
     includePartialMessages: true,
+    // 探索の隔離。ツール出力をサブエージェント側に留め、主スレッドには報告だけ返す。
+    ...(input.isolateExploration ? { agents: toAgentsOption() } : {}),
     ...(input.mode === "full" && input.sessionId ? { resume: input.sessionId } : {}),
     ...(input.canUseTool ? { canUseTool: input.canUseTool } : {}),
     ...(input.abortController ? { abortController: input.abortController } : {}),
@@ -324,7 +339,11 @@ export function extractUsage(
 /** SDK を1ターン実行する。 */
 export async function run(opts: RunOptions): Promise<RunResult> {
   const recent = selectHistory(opts.mode, opts.history, opts.recentTurns);
-  const prompt = buildPrompt(opts.state, opts.instruction, recent);
+  // 調査の指示なら、主スレッドに「自分で読まず explorer に投げろ」と伝える。
+  // agents を定義しただけでは使われない。
+  const delegate = opts.isolateExploration === true && shouldDelegate(opts.instruction);
+  const prompt =
+    buildPrompt(opts.state, opts.instruction, recent) + (delegate ? DELEGATE_HINT : "");
 
   const sdkOptions = buildSdkOptions({
     cwd: opts.cwd,
@@ -332,6 +351,7 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     sessionId: opts.sessionId,
     canUseTool: opts.canUseTool,
     abortController: opts.abortController,
+    isolateExploration: opts.isolateExploration,
   });
 
   let response = "";
@@ -418,5 +438,6 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     usage,
     rateLimit,
     stateWarnings: patched.warnings,
+    ...(delegate ? { delegated: true } : {}),
   };
 }

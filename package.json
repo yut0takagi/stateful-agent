@@ -87,6 +87,11 @@
           "type": "string",
           "default": "",
           "description": "フォルダ→OKF type 対応表(manifest)のパス。空なら .agent/manifest.yaml → vault設計/manifest.yaml の順に自動探索する"
+        },
+        "statefulAgent.isolateExploration": {
+          "type": "boolean",
+          "default": true,
+          "description": "調査の指示を explorer サブエージェントに隔離する。ツール出力がサブエージェント側に留まり、主スレッドには報告だけ返る（編集の指示では隔離しない）"
         }
       }
     }
