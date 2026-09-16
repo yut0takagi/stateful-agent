@@ -60,6 +60,10 @@ export interface BenchTurn {
   stateBytes: number;
   /** そのターンで何をしたか。読んだファイル・実行したコマンドの証跡。 */
   tools?: ToolSummary;
+  /** ツール出力を中略して削った文字数。--trim のときだけ入る。 */
+  trimmedChars?: number;
+  /** 中略したツール呼び出しの件数 / 全件。 */
+  trimmedCalls?: number;
 }
 
 export interface ModeComparison {

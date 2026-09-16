@@ -19,6 +19,7 @@ import {
   type AgentState,
   type HistoryMode,
 } from "./state.js";
+import { TurnBudget, type BudgetReport } from "./toolbudget.js";
 
 /**
  * SDK は ESM 専用だが VSCode 拡張は CommonJS で動く。
@@ -54,6 +55,11 @@ export interface RunOptions {
   onToolUse?: (id: string, name: string, input: Record<string, unknown>) => void;
   /** ツール結果を受け取る。 */
   onToolResult?: (id: string, content: string, isError: boolean) => void;
+  /**
+   * ツール出力に予算をかける。省略すると従来どおり全量が流れる。
+   * 呼び出し側がターンごとに作り直す（持ち回すと予算が枯れたまま次ターンに入る）。
+   */
+  budget?: TurnBudget;
 }
 
 export interface RunResult {
@@ -65,6 +71,8 @@ export interface RunResult {
   rateLimit?: unknown;
   /** state が引き継ぎ書として成立していない点。保存は通したうえで人に見せる。 */
   stateWarnings: string[];
+  /** ツール出力をどれだけ削ったか。budget を渡したときだけ入る。 */
+  budgetReport?: BudgetReport;
 }
 
 /**
@@ -211,6 +219,41 @@ export interface SdkOptionInput {
   sessionId?: string;
   canUseTool?: RunOptions["canUseTool"];
   abortController?: AbortController;
+  /**
+   * ツール出力の予算。渡すと PostToolUse フックでモデルに届く前に削る。
+   * 省略すると従来どおり全量が流れる（既存の挙動を変えない）。
+   */
+  budget?: TurnBudget;
+}
+
+/**
+ * ツール出力を削る PostToolUse フックを組み立てる。
+ *
+ * `updatedToolOutput` は「Replaces the tool output before it is sent to the model」。
+ * ここが実測で効く唯一の口だった（履歴を切る操作は inputTokens にしか効かず、
+ * それはコストの 0.0% しか占めていない）。
+ *
+ * 削る必要がないときは hookSpecificOutput を返さない。空の差し替えを返すと
+ * 並行して走る他フックの差し替えと last-write-wins で競合し、
+ * 本物の削減を打ち消す可能性がある（SDK の型注記が明示している）。
+ */
+export function buildPostToolUseHook(budget: TurnBudget) {
+  return async (input: unknown): Promise<Record<string, unknown>> => {
+    const i = input as { tool_name?: string; tool_response?: unknown };
+    if (typeof i.tool_name !== "string") {
+      return {};
+    }
+    const replaced = budget.apply(i.tool_name, i.tool_response);
+    if (replaced === null) {
+      return {};
+    }
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PostToolUse",
+        updatedToolOutput: replaced,
+      },
+    };
+  };
 }
 
 /**
@@ -222,6 +265,13 @@ export interface SdkOptionInput {
 export function buildSdkOptions(input: SdkOptionInput): Record<string, unknown> {
   return {
     cwd: input.cwd,
+    ...(input.budget
+      ? {
+          hooks: {
+            PostToolUse: [{ hooks: [buildPostToolUseHook(input.budget)] }],
+          },
+        }
+      : {}),
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
@@ -332,6 +382,7 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     sessionId: opts.sessionId,
     canUseTool: opts.canUseTool,
     abortController: opts.abortController,
+    budget: opts.budget,
   });
 
   let response = "";
@@ -418,5 +469,6 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     usage,
     rateLimit,
     stateWarnings: patched.warnings,
+    ...(opts.budget ? { budgetReport: opts.budget.report() } : {}),
   };
 }

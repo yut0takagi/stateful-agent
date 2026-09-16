@@ -16,6 +16,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { run, type Turn } from "../core/agent.js";
+import { TurnBudget } from "../core/toolbudget.js";
 import { INITIAL_STATE, parseState, serializeState, type AgentState, type HistoryMode } from "../core/state.js";
 import {
   buildComparison,
@@ -33,6 +34,8 @@ interface Options {
   scenario: string;
   outDir: string;
   recentTurns: number;
+  /** ツール出力に予算をかけるか。--trim で有効。 */
+  trim: boolean;
 }
 
 function parseArgs(argv: string[]): Options {
@@ -56,6 +59,8 @@ function parseArgs(argv: string[]): Options {
     scenario: get("scenario", join(dirname(process.argv[1] ?? "."), "default.txt")),
     outDir: get("out", ".bench"),
     recentTurns: Number(get("recent-turns", "3")),
+    // 既定は無効。有効/無効を同じシナリオで回して差を測るための旗。
+    trim: argv.includes("--trim"),
   };
 }
 
@@ -97,7 +102,8 @@ async function main(): Promise<void> {
 
   console.log(`対象: ${opts.repo}`);
   console.log(`シナリオ: ${scenario.prompts.length} 問を巡回`);
-  console.log(`モード: ${opts.modes.join(" / ")} × ${opts.turns} ターン\n`);
+  console.log(`モード: ${opts.modes.join(" / ")} × ${opts.turns} ターン`);
+  console.log(`ツール出力の中略: ${opts.trim ? "有効" : "無効"}\n`);
 
   const results: BenchTurn[] = [];
   const logPath = join(opts.outDir, "turns.jsonl");
@@ -128,6 +134,8 @@ async function main(): Promise<void> {
       // そのターンで何をしたかを残す。トークン数だけでは
       // 「なぜ重かったか」を説明できない。
       const calls: ToolCall[] = [];
+      // ターンごとに作り直す。持ち回すと予算が枯れたまま次ターンに入る。
+      const budget = opts.trim ? new TurnBudget() : undefined;
 
       let result;
       try {
@@ -140,6 +148,7 @@ async function main(): Promise<void> {
           // 対象リポジトリで動かす。読むファイルを揃えないと比較にならない。
           cwd: opts.repo,
           sessionId,
+          budget,
           onToolUse: (_id, name, input) => {
             calls.push({ name, input });
           },
@@ -167,6 +176,12 @@ async function main(): Promise<void> {
         statePatched: result.stateWarnings !== undefined && state !== undefined,
         stateBytes,
         tools: summarizeTools(calls),
+        ...(result.budgetReport
+          ? {
+              trimmedChars: result.budgetReport.savedChars,
+              trimmedCalls: result.budgetReport.trimmedCalls,
+            }
+          : {}),
       };
       results.push(turn);
       // 途中で落ちても失われないよう1ターンごとに書く。
@@ -179,7 +194,8 @@ async function main(): Promise<void> {
           ` $${turn.costUSD.toFixed(2)}` +
           ` ${(ms / 1000).toFixed(1)}s` +
           ` state=${turn.stateBytes}B` +
-          ` tools=${turn.tools?.total ?? 0}(${turn.tools?.filesRead.length ?? 0}files)`,
+          ` tools=${turn.tools?.total ?? 0}(${turn.tools?.filesRead.length ?? 0}files)` +
+          (turn.trimmedChars ? ` trim=-${turn.trimmedChars.toLocaleString()}c` : ""),
       );
     }
     console.log("");

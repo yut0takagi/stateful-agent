@@ -87,6 +87,36 @@
           "type": "string",
           "default": "",
           "description": "フォルダ→OKF type 対応表(manifest)のパス。空なら .agent/manifest.yaml → vault設計/manifest.yaml の順に自動探索する"
+        },
+        "statefulAgent.trimToolOutput": {
+          "type": "boolean",
+          "default": true,
+          "description": "ツール出力がモデルに届く前に上限で中略する。実測でコスト削減が効くのはここ（履歴モードは inputTokens にしか効かず、それはコストの0.0%）"
+        },
+        "statefulAgent.toolOutputLimits.read": {
+          "type": "number",
+          "default": 4000,
+          "description": "Read / NotebookRead の1回あたり上限（文字）"
+        },
+        "statefulAgent.toolOutputLimits.bash": {
+          "type": "number",
+          "default": 3000,
+          "description": "Bash / BashOutput の1回あたり上限（文字）"
+        },
+        "statefulAgent.toolOutputLimits.search": {
+          "type": "number",
+          "default": 2000,
+          "description": "Grep / Glob の1回あたり上限（文字）"
+        },
+        "statefulAgent.toolOutputLimits.other": {
+          "type": "number",
+          "default": 3000,
+          "description": "その他ツールの1回あたり上限（文字）"
+        },
+        "statefulAgent.toolOutputLimits.turnTotal": {
+          "type": "number",
+          "default": 40000,
+          "description": "1ターンのツール出力合計の上限（文字）。超えると以降を強く絞る"
         }
       }
     }

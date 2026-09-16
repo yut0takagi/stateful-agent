@@ -42,6 +42,7 @@ import { buildRunRecord, formatRunLine, parseRunLog, summarize } from "./core/me
 import { buildGraph, layoutGraph, toRenderModel } from "./core/graph.js";
 import { SendQueue } from "./core/queue.js";
 import { renderBashResult, summarizeToolUse } from "./core/toolview.js";
+import { DEFAULT_LIMITS, TurnBudget } from "./core/toolbudget.js";
 import { evaluate, type EngineDeps } from "./rules/engine.js";
 import {
   loadRules,
@@ -364,6 +365,19 @@ async function handleSend(text: string): Promise<void> {
   // ターンごとに作り直す。前のターンの抑止状態を持ち越さない。
   const streamFilter = new StreamFilter();
 
+  // ツール出力の予算。ターンごとに作り直す（持ち回すと予算が枯れたまま次ターンに入る）。
+  // 実測でコスト削減が効くのはここだけだった（履歴を切る操作は inputTokens にしか
+  // 効かず、それはコストの 0.0% しか占めていない）。
+  const budget = config("trimToolOutput", true)
+    ? new TurnBudget({
+        read: config("toolOutputLimits.read", DEFAULT_LIMITS.read),
+        bash: config("toolOutputLimits.bash", DEFAULT_LIMITS.bash),
+        search: config("toolOutputLimits.search", DEFAULT_LIMITS.search),
+        other: config("toolOutputLimits.other", DEFAULT_LIMITS.other),
+        turnTotal: config("toolOutputLimits.turnTotal", DEFAULT_LIMITS.turnTotal),
+      })
+    : undefined;
+
   // 走っている間だけ保持する。stop メッセージでこれを abort する。
   const controller = new AbortController();
   running = controller;
@@ -378,6 +392,7 @@ async function handleSend(text: string): Promise<void> {
       cwd: root,
       sessionId,
       abortController: controller,
+      budget,
       canUseTool: makeCanUseTool(root) as never,
       onText: (chunk) => {
         // state フェンスは機械が読むもの。人が読む本文には出さない。
@@ -458,6 +473,19 @@ async function handleSend(text: string): Promise<void> {
       post({
         type: "meta",
         text: `[${mode}] in ${inputTokens.toLocaleString()} / out ${outputTokens.toLocaleString()}${cache} tokens`,
+      });
+    }
+
+    // ツール出力をどれだけ削ったかを見せる。効き目が見えないと
+    // 上限値を実測で動かせない（既定値は仮置きなので人が調整する前提）。
+    const br = result.budgetReport;
+    if (br && br.trimmedCalls > 0) {
+      const pct = Math.round((br.savedChars / br.totalOriginalChars) * 100);
+      post({
+        type: "meta",
+        text:
+          `ツール出力 ${br.trimmedCalls}/${br.calls} 件を中略: ` +
+          `${br.totalOriginalChars.toLocaleString()} → ${br.totalKeptChars.toLocaleString()} 文字（-${pct}%）`,
       });
     }
 
