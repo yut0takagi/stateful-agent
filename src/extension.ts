@@ -42,6 +42,7 @@ import { buildRunRecord, formatRunLine, parseRunLog, summarize } from "./core/me
 import { buildGraph, layoutGraph, toRenderModel } from "./core/graph.js";
 import { SendQueue } from "./core/queue.js";
 import { renderBashResult, summarizeToolUse } from "./core/toolview.js";
+import { DEFAULT_READ_LIMITS, planBash, planRead, type FileFacts } from "./core/readplan.js";
 import { evaluate, type EngineDeps } from "./rules/engine.js";
 import {
   loadRules,
@@ -248,6 +249,9 @@ function makeCanUseTool(root: string) {
       return { behavior: "allow" as const, updatedInput: input };
     }
 
+    // 規律を通った入力を土台に、読み方の誘導をかける。
+    // 規律（deny/ask）が先。コスト削減が安全側の判断を上書きしてはいけない。
+    let allowed = input;
     if (decision.updatedInput) {
       post({ type: "rule", mark: "✎", text: `${decision.appliedRules.join(", ")} が入力を補正` });
       // 絶対パスに戻して返す
@@ -257,11 +261,82 @@ function makeCanUseTool(root: string) {
           restored[key] = input[key];
         }
       }
-      return { behavior: "allow" as const, updatedInput: restored };
+      allowed = restored;
     }
 
-    return { behavior: "allow" as const, updatedInput: input };
+    if (config("guideReads", true)) {
+      const narrowed = applyReadPlan(root, toolName, allowed);
+      if (narrowed) {
+        post({ type: "rule", mark: "◧", text: narrowed.reason });
+        return { behavior: "allow" as const, updatedInput: narrowed.updatedInput };
+      }
+    }
+
+    return { behavior: "allow" as const, updatedInput: allowed };
   };
+}
+
+/**
+ * ツール入力に読み方の誘導をかける。絞らないなら null。
+ *
+ * 出力を削る（PostToolUse）のではなく、大きく読ませない。
+ * ファイル取得自体のコストも払わずに済む。
+ */
+function applyReadPlan(
+  root: string,
+  toolName: string,
+  input: Record<string, unknown>,
+): { updatedInput: Record<string, unknown>; reason: string } | null {
+  const limits = {
+    maxLines: config("readLimits.maxLines", DEFAULT_READ_LIMITS.maxLines),
+    windowLines: config("readLimits.windowLines", DEFAULT_READ_LIMITS.windowLines),
+    maxBytes: config("readLimits.maxBytes", DEFAULT_READ_LIMITS.maxBytes),
+  };
+
+  if (toolName === "Read") {
+    const fp = input.file_path;
+    if (typeof fp !== "string") {
+      return null;
+    }
+    const decision = planRead(input, fileFacts(fp.startsWith("/") ? fp : join(root, fp)), limits);
+    return decision.kind === "narrow"
+      ? { updatedInput: decision.updatedInput, reason: decision.reason }
+      : null;
+  }
+
+  if (toolName === "Bash") {
+    const cmd = input.command;
+    if (typeof cmd !== "string") {
+      return null;
+    }
+    const decision = planBash(cmd, config("bashOutputLines", 200));
+    return decision.kind === "narrow"
+      ? { updatedInput: { ...input, command: decision.command }, reason: decision.reason }
+      : null;
+  }
+
+  return null;
+}
+
+/**
+ * ファイルの行数とバイト数を数える。
+ *
+ * 読めなければ null を返し、呼び出し側は「触らない」を選ぶ。
+ * 推測で範囲を付けると短いファイルの後半を理由なく隠すことになる。
+ */
+function fileFacts(path: string): FileFacts {
+  try {
+    const bytes = statSync(path).size;
+    // 巨大ファイルを行数のために全読みしたら本末転倒。
+    // 一定を超えたらバイト数だけで判断する。
+    if (bytes > 2_000_000) {
+      return { lines: null, bytes };
+    }
+    const content = readFileSync(path, "utf8");
+    return { lines: content.split("\n").length, bytes };
+  } catch {
+    return { lines: null, bytes: null };
+  }
 }
 
 /** ファイル変更後の後処理を走らせる。 */

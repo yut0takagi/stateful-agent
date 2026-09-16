@@ -87,6 +87,31 @@
           "type": "string",
           "default": "",
           "description": "フォルダ→OKF type 対応表(manifest)のパス。空なら .agent/manifest.yaml → vault設計/manifest.yaml の順に自動探索する"
+        },
+        "statefulAgent.guideReads": {
+          "type": "boolean",
+          "default": true,
+          "description": "大きいファイルの Read を範囲読みに誘導し、出力が膨らむ Bash に head を足す。出力を削るのではなく大きく読ませない（取得自体のコストも払わない）"
+        },
+        "statefulAgent.readLimits.maxLines": {
+          "type": "number",
+          "default": 800,
+          "description": "この行数を超える Read を範囲読みに落とす"
+        },
+        "statefulAgent.readLimits.windowLines": {
+          "type": "number",
+          "default": 400,
+          "description": "範囲読みに落とすときの1回あたり行数"
+        },
+        "statefulAgent.readLimits.maxBytes": {
+          "type": "number",
+          "default": 60000,
+          "description": "このバイト数を超えるファイルは行数に関わらず範囲読みにする（1行が巨大なケース）"
+        },
+        "statefulAgent.bashOutputLines": {
+          "type": "number",
+          "default": 200,
+          "description": "出力が膨らむ Bash コマンドに足す head の行数"
         }
       }
     }
