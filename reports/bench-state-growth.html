@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stateful Agent 実測レポート</title>
+<style>
+:root{
+  --ink:#1a1a1a;
+  --ink-2:#555555;
+  --ink-3:#8e8e8e;
+  --accent:#173f66;
+  --accent-tint:#eef3f8;
+  --hairline:#d9d9d9;
+  --fill-gray:#e7e9ec;
+  --paper:#ffffff;
+}
+html{color-scheme:light}
+body{
+  margin:0;background:var(--paper);color:var(--ink);
+  font-family:"Helvetica Neue",Arial,"Hiragino Kaku Gothic ProN","Hiragino Sans","Yu Gothic Medium","Yu Gothic",Meiryo,sans-serif;
+  font-size:15px;line-height:1.9;
+  border-top:6px solid var(--accent);
+  -webkit-font-smoothing:antialiased;
+}
+.page{max-width:760px;margin:0 auto;padding:56px clamp(24px,6vw,48px) 96px}
+
+.doc-header{padding-bottom:28px;border-bottom:1px solid var(--ink)}
+.eyebrow{font-size:11px;letter-spacing:.16em;color:var(--ink-3);text-transform:uppercase;margin:0 0 20px}
+h1{font-size:27px;line-height:1.5;letter-spacing:.02em;margin:0 0 12px;font-feature-settings:"palt" 1}
+.lead{font-size:14px;color:var(--ink-2);margin:0 0 24px;max-width:38em}
+.doc-meta{font-size:12px;color:var(--ink-3);display:flex;gap:24px;flex-wrap:wrap}
+
+.page>section{border-top:1px solid var(--hairline);padding-top:44px;margin-top:64px}
+.page>section:first-of-type{border-top:0;padding-top:0;margin-top:56px}
+h2{font-size:19px;letter-spacing:.03em;margin:0;font-feature-settings:"palt" 1}
+h2 .no{color:var(--accent);margin-right:14px;font-variant-numeric:tabular-nums}
+.msg{font-size:16px;font-weight:600;line-height:1.8;margin:18px 0 24px;max-width:36em}
+h3{font-size:15px;margin:36px 0 8px}
+p{margin:0 0 16px;max-width:42em}
+
+ul,ol{margin:0 0 16px;padding-left:1.4em;max-width:41em}
+li{margin-bottom:6px}
+ul{list-style:none;padding-left:1.2em}
+ul li::before{content:"–";float:left;margin-left:-1.2em;color:var(--ink-3)}
+
+.summary{list-style:none;margin:24px 0 0;padding:0;counter-reset:s;max-width:44em}
+.summary li{counter-increment:s;position:relative;padding-left:2.4em;margin-bottom:14px}
+.summary li::before{
+  content:counter(s,decimal-leading-zero);position:absolute;left:0;top:.4em;
+  font-size:12px;font-weight:700;color:var(--accent);letter-spacing:.04em;
+  font-variant-numeric:tabular-nums;
+}
+
+.kpis{display:flex;flex-wrap:wrap;row-gap:24px;margin:32px 0 8px}
+.kpi{padding:2px 32px}
+.kpi:first-child{padding-left:0}
+.kpi+.kpi{border-left:1px solid var(--hairline)}
+.kpi .v{font-size:30px;font-weight:700;color:var(--accent);line-height:1.3;
+  font-variant-numeric:tabular-nums;letter-spacing:.01em}
+.kpi .v small{font-size:14px;font-weight:600;margin-left:2px}
+.kpi .l{font-size:11.5px;color:var(--ink-3);letter-spacing:.06em;margin-top:6px}
+
+.tbl{overflow-x:auto}
+table{width:100%;border-collapse:collapse;margin:28px 0 8px;font-size:13px;line-height:1.6}
+caption{text-align:left;font-size:12.5px;font-weight:600;margin-bottom:10px}
+th{font-size:12px;font-weight:600;text-align:left;padding:10px 12px;
+  border-top:2px solid var(--ink);border-bottom:1px solid var(--ink);vertical-align:bottom}
+td{padding:10px 12px;border-bottom:1px solid var(--hairline);vertical-align:top}
+th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
+tr.total td{border-top:1px solid var(--ink);border-bottom:2px solid var(--ink);
+  font-weight:600;background:var(--accent-tint)}
+
+figure{margin:32px 0 8px}
+figcaption{font-size:12.5px;font-weight:600;margin-bottom:14px}
+figure svg{width:100%;height:auto;display:block}
+svg text{font-family:inherit}
+.fig-scroll{overflow-x:auto}
+.src{font-size:11.5px;color:var(--ink-3);margin:6px 0 0}
+.note{font-size:12.5px;color:var(--ink-2);border-left:2px solid var(--hairline);
+  padding:2px 0 2px 14px;margin:24px 0 16px;max-width:40em}
+
+.matrix{display:grid;grid-template-columns:var(--mx-label,140px) repeat(var(--mx-cols,2),1fr);
+  gap:18px 20px;margin:28px 0 8px;min-width:560px}
+.mx-h{font-size:11.5px;font-weight:600;color:var(--ink-2);text-align:center;
+  align-self:end;padding-bottom:8px;border-bottom:1px solid var(--ink)}
+.mx-label{background:var(--accent);color:#fff;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;text-align:center;gap:2px;
+  font-size:12px;font-weight:700;line-height:1.5;padding:12px 10px}
+.mx-label small{font-size:10px;font-weight:600;opacity:.7;letter-spacing:.08em}
+.mx-label.alt{background:var(--fill-gray);color:var(--ink)}
+.mx-cell{font-size:12px;line-height:1.75}
+.mx-cell ul{margin:0}
+.mx-cell li{margin-bottom:5px}
+
+b,strong{font-weight:700}
+.em{color:var(--accent);font-weight:700}
+a{color:inherit;text-decoration:underline;text-decoration-color:var(--hairline);text-underline-offset:3px}
+a:hover{text-decoration-color:var(--accent)}
+
+.doc-footer{margin-top:88px;padding-top:20px;border-top:1px solid var(--hairline);
+  font-size:11.5px;color:var(--ink-3);display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+
+@media print{
+  @page{size:A4;margin:16mm}
+  body{border-top-width:4px}
+  .page{max-width:none;padding:0}
+  .page>section{margin-top:48px;padding-top:32px}
+  table,figure,.kpis,.matrix{break-inside:avoid}
+  a{text-decoration:none}
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="doc-header">
+    <p class="eyebrow">開発メモ ／ 実測レポート</p>
+    <h1>履歴を捨てると逆に高くつく — Stateful Agent 対照実験</h1>
+    <p class="lead">会話履歴の代わりに構造化 state を持つ設計が、実運用で軽くなるかを対照実験で検証した。結論は否定的である。履歴を持つ full が最も安く、履歴を捨てた2モードは33%高い。キャッシュの作り直しが原因である。</p>
+    <div class="doc-meta"><span>対象: devtch リポジトリ</span><span>3モード比較（各5ターン時点）</span><span>claude.ai サブスク枠</span></div>
+  </header>
+
+  <section>
+    <h2>エグゼクティブサマリー</h2>
+    <ol class="summary">
+      <li><b>履歴を持つ full が最も安い。</b>同一5ターンで $0.67/ターン。履歴を捨てた stateless（$1.00）・recent（$0.99）より33%安く、設計の狙いと逆の結果になった。</li>
+      <li><b>原因はキャッシュの作り直し。</b>毎ターン新しいセッションを作る2モードは cache_creation が入力の12%前後に達する。継続する full は5.2%で済む。書き込みは読み込みより単価が高い。</li>
+      <li><b>state は12ターンで10.8倍に膨張した。</b>3,691B → 39,732B の線形増加。履歴を捨てても、同じものが state という別の形で積み上がる。</li>
+      <li><b>次の一手は2つ。</b>state の刈り込み（アーカイブ方式）と、セッション継続の見直し。後者は設計の根幹に関わる。</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2><span class="no">01</span>実験の設計</h2>
+    <p class="msg">同じプロンプト列を、履歴の持ち方だけ変えて流す対照実験とした。</p>
+
+    <p>単発の質問を各モードで1回ずつ投げても差は出ない。履歴を捨てる効果はターンが積み上がって初めて現れるため、会話が継続する7問のシナリオを巡回させる方式を採った。</p>
+
+    <div class="tbl">
+    <table>
+      <caption>表1: 実験条件</caption>
+      <thead>
+        <tr><th>項目</th><th>設定</th><th>理由</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>対象</td><td>devtch リポジトリ</td><td>3モードとも同じファイルを読ませる</td></tr>
+        <tr><td>シナリオ</td><td>7問を巡回</td><td>前のターンを踏まえないと答えられない流れ</td></tr>
+        <tr><td>ターン数</td><td>各12</td><td>一巡半。state が積み上がった状態も観測する</td></tr>
+        <tr><td>分離</td><td>モードごとに独立ディレクトリ</td><td>state と履歴が混ざらなければ十分。Docker は不要</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="src">出所: apps/stateful-agent/src/bench/。実行ログは .bench/turns.jsonl</p>
+  </section>
+
+  <section>
+    <h2><span class="no">02</span>state の膨張</h2>
+    <p class="msg">stateless モードでも state は線形に増え続け、12ターンで10.8倍になった。</p>
+
+    <div class="kpis">
+      <div class="kpi"><div class="v">+3,276<small>B/t</small></div><div class="l">STATELESS の増加速度</div></div>
+      <div class="kpi"><div class="v">+3,409<small>B/t</small></div><div class="l">RECENT の増加速度</div></div>
+      <div class="kpi"><div class="v">4<small>%</small></div><div class="l">両者の差</div></div>
+    </div>
+
+    <figure>
+      <figcaption>図表1: state サイズの推移（2モード・各12ターン）</figcaption>
+      <svg viewBox="0 0 700 260" role="img" aria-label="stateless と recent の state サイズがほぼ同一の傾きで線形に増加し、12ターン目で約4万バイトに達する">
+        <line x1="60" y1="220" x2="670" y2="220" stroke="#a8adb5" stroke-width="1"/>
+        <line x1="60" y1="40" x2="60" y2="220" stroke="#a8adb5" stroke-width="1"/>
+        <line x1="60" y1="175" x2="670" y2="175" stroke="#e7e9ec" stroke-width="1"/>
+        <line x1="60" y1="130" x2="670" y2="130" stroke="#e7e9ec" stroke-width="1"/>
+        <line x1="60" y1="85" x2="670" y2="85" stroke="#e7e9ec" stroke-width="1"/>
+        <text x="52" y="224" text-anchor="end" font-size="10" fill="#8e8e8e">0</text>
+        <text x="52" y="179" text-anchor="end" font-size="10" fill="#8e8e8e">10K</text>
+        <text x="52" y="134" text-anchor="end" font-size="10" fill="#8e8e8e">20K</text>
+        <text x="52" y="89" text-anchor="end" font-size="10" fill="#8e8e8e">30K</text>
+        <text x="52" y="44" text-anchor="end" font-size="10" fill="#8e8e8e">40K</text>
+        <polyline fill="none" stroke="#a8adb5" stroke-width="2"
+          points="60,201 115,189 170,175 225,164 280,144 335,125 390,107 445,100 500,89 555,71 610,58 665,40"/>
+        <polyline fill="none" stroke="#173f66" stroke-width="2.5"
+          points="60,203 115,194 170,179 225,171 280,148 335,134 390,108 445,100 500,87 555,71 610,58 665,41"/>
+        <circle cx="665" cy="41" r="4" fill="#173f66"/>
+        <circle cx="665" cy="40" r="3" fill="#a8adb5"/>
+        <text x="60" y="245" text-anchor="middle" font-size="10" fill="#8e8e8e">1</text>
+        <text x="665" y="245" text-anchor="middle" font-size="10" fill="#8e8e8e">12</text>
+        <text x="362" y="245" text-anchor="middle" font-size="10.5" fill="#8e8e8e">ターン</text>
+        <text x="648" y="33" text-anchor="end" font-size="11" fill="#8e8e8e">recent 41,895B</text>
+        <text x="648" y="57" text-anchor="end" font-size="11.5" font-weight="700" fill="#173f66">stateless 39,732B</text>
+        <text x="75" y="200" font-size="11" fill="#8e8e8e">3,691B</text>
+      </svg>
+      <p class="src">出所: .bench/turns.jsonl（各12ターン完走）。2本はほぼ重なる。濃紺が stateless、グレーが recent</p>
+    </figure>
+
+    <p>原因は明確である。決定レコードは <b>追記される一方で、消える仕組みがない</b>。部分更新（<code>決定+</code>）を導入して既存の書き直しは止めたが、蓄積そのものは止まらない。</p>
+
+    <div class="note">規約には「確定して動かないものは統合してよい」と書いてあるが、モデルは統合しない。追記のほうが出力として楽だからである。指示だけでは制御できない。</div>
+
+    <h3>recent モードでも同じ傾向</h3>
+    <p>進行中の recent モード（4ターン時点）でも +2,858B/ターンと、ほぼ同じ傾きを示している。<b>モードによらず state は膨らむ</b>ということである。</p>
+  </section>
+
+  <section>
+    <h2><span class="no">03</span>3モードの比較</h2>
+    <p class="msg">履歴を持つ full が最も安い。履歴を捨てる設計が裏目に出ている。</p>
+
+    <div class="kpis">
+      <div class="kpi"><div class="v">$0.67<small>/t</small></div><div class="l">FULL（履歴あり）</div></div>
+      <div class="kpi"><div class="v">$0.99<small>/t</small></div><div class="l">RECENT</div></div>
+      <div class="kpi"><div class="v">$1.00<small>/t</small></div><div class="l">STATELESS</div></div>
+    </div>
+
+    <div class="tbl">
+    <table>
+      <caption>表2: 3モードの比較（各5ターン時点の平均）</caption>
+      <thead>
+        <tr><th>指標</th><th class="num">stateless</th><th class="num">recent</th><th class="num">full</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>コスト（参考値）</td><td class="num">1.00</td><td class="num">0.99</td><td class="num">0.67</td></tr>
+        <tr><td>出力トークン</td><td class="num">7,389</td><td class="num">8,708</td><td class="num">8,833</td></tr>
+        <tr><td>キャッシュ読み込み</td><td class="num">457,838</td><td class="num">468,373</td><td class="num">441,194</td></tr>
+        <tr class="total"><td>キャッシュ作成</td><td class="num">58,774</td><td class="num">54,145</td><td class="num">23,035</td></tr>
+        <tr><td>所要時間（秒）</td><td class="num">123</td><td class="num">151</td><td class="num">145</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="src">出所: .bench/turns.jsonl。full は進行中のため5ターン時点で揃えた</p>
+
+    <p>差を生んでいるのは<b>キャッシュ作成（cache_creation）</b>である。キャッシュへの書き込みは読み込みより単価が高く、通常5倍程度になる。</p>
+
+    <p>stateless と recent は毎ターン新しいセッションを作るため、<b>キャッシュを作り直し続ける</b>。入力に対する比率は12%前後に達する。一方 full は resume でセッションを継続するので5.2%で済む。</p>
+
+    <div class="note">入力トークン（in）は指標として使えない。full は履歴がキャッシュに乗るため in=1 まで落ちることがある。in が小さいことは、プロンプトが小さいことを意味しない。</div>
+  </section>
+
+  <section>
+    <h2><span class="no">04</span>コストの支配項</h2>
+    <p class="msg">入力側の削減は成功しているが、コストを決めているのは読み込み量と出力量である。</p>
+
+    <div class="tbl">
+    <table>
+      <caption>表3: stateless / recent の12ターン完走時の平均</caption>
+      <thead>
+        <tr><th>指標</th><th class="num">stateless</th><th class="num">recent</th><th>評価</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>入力トークン</td><td class="num">17.0</td><td class="num">13.7</td><td>いずれも極小。履歴を載せていない</td></tr>
+        <tr><td>キャッシュ読み込み</td><td class="num">452,630</td><td class="num">342,428</td><td>振れ幅内。支配項</td></tr>
+        <tr><td>出力トークン</td><td class="num">8,355</td><td class="num">7,985</td><td>差なし。支配項</td></tr>
+        <tr><td>所要時間（秒）</td><td class="num">140</td><td class="num">138</td><td>差なし</td></tr>
+        <tr class="total"><td>state 増加（B/ターン）</td><td class="num">3,276</td><td class="num">3,409</td><td>履歴を捨てた側がわずかに少ない程度</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="src">出所: .bench/turns.jsonl。stateless / recent 各12ターン完走分の平均</p>
+
+    <p>履歴を一切持たない stateless と、直近3ターンを持つ recent の間に<b>有意な差はない</b>。state の増加速度に至っては stateless の方がわずかに少ない程度で、実質同じである。</p>
+
+    <p>入力トークンが十数まで落ちている一方、キャッシュ読み込みは35〜45万トークン規模である。この差が示すのは、<b>コストの出所が履歴ではなくエージェントの作業そのもの</b>だということである。ファイルを読んで評価する仕事をしている以上、この量は削れない。</p>
+
+    <h3>state が効いた瞬間もあった</h3>
+    <p>recent の最終ターンだけ cache_read が 58,802 と、他（16万〜61万）の10分の1に落ちた。同じシナリオの同じ位置なので、<b>モデルがファイルを読まず state だけで答えた</b>と見られる。ただし24ターン中1回であり、再現性は確認できていない。</p>
+
+    <div class="note">金額表示（costUSD）は SDK が list price で計算した参考値であり、実際の請求額ではない。実際に消費しているのは claude.ai サブスクのレート枠（5時間枠・7日枠）である。</div>
+  </section>
+
+  <section>
+    <h2><span class="no">05</span>設計の前提が崩れている点</h2>
+    <p class="msg">論文の定式は state が有界である前提だが、実装には上限も刈り込みもない。</p>
+
+    <p>SKILL.state の <code>Σt+1 = Σt ⊕ ΔΣt</code> は、state が一定規模に収まることを暗黙の前提としている。実測はこの前提が成立していないことを示した。</p>
+
+    <div class="fig-scroll"><div class="matrix" style="--mx-cols:2;--mx-label:120px">
+      <div class="mx-h"></div>
+      <div class="mx-h">設計上の想定</div>
+      <div class="mx-h">実測</div>
+
+      <div class="mx-label"><small>01</small>state の規模</div>
+      <div class="mx-cell">作業に必要な情報だけが残り、一定に収まる</div>
+      <div class="mx-cell">線形に増加。12ターンで 39,732B、30ターンなら 100KB 超</div>
+
+      <div class="mx-label"><small>02</small>履歴との関係</div>
+      <div class="mx-cell">履歴を捨てることで軽くなる</div>
+      <div class="mx-cell">stateless と recent で有意差なし。state が履歴の代替として積み上がる</div>
+
+      <div class="mx-label"><small>03</small>削減の効果</div>
+      <div class="mx-cell">入力トークンの削減がコストに効く</div>
+      <div class="mx-cell">入力は平均17。支配項は読み込みと出力</div>
+    </div></div>
+    <p class="src">出所: 設計spec（2026-09-09）と .bench/turns.jsonl の対比</p>
+
+    <p>この設計が想定していたのは<b>定型タスク</b>である。履歴が長大になる一方で応答が短い場面なら、履歴を捨てる効果は大きい。今回測ったのはコードを読んで評価する探索的な作業であり、その条件に当てはまらない。</p>
+  </section>
+
+  <section>
+    <h2><span class="no">06</span>推奨アクション</h2>
+    <p class="msg">state の刈り込みを実装する。蓄積は失わず、プロンプトに載る量だけ減らす。</p>
+
+    <div class="fig-scroll"><div class="matrix" style="--mx-cols:2;--mx-label:130px">
+      <div class="mx-h"></div>
+      <div class="mx-h">内容</div>
+      <div class="mx-h">評価</div>
+
+      <div class="mx-label alt"><small>案 A</small>件数で打ち切る</div>
+      <div class="mx-cell">直近N件だけ残し、古い決定を捨てる</div>
+      <div class="mx-cell">単純だが、古い重要な決定が消える。判断の蓄積という目的と衝突する</div>
+
+      <div class="mx-label alt"><small>案 B</small>確定分を要約</div>
+      <div class="mx-cell">状態が確定のまま動かない決定を1行に圧縮</div>
+      <div class="mx-cell">経緯は残るが情報が落ちる。圧縮の判断をモデルに任せる必要がある</div>
+
+      <div class="mx-label"><small>案 C</small>アーカイブへ退避</div>
+      <div class="mx-cell">current.json から archive.jsonl へ移す。グラフは全件、プロンプトは直近のみ</div>
+      <div class="mx-cell"><b>推奨。</b>蓄積を失わずプロンプトだけ軽くなる。判断の追跡可能性も保てる</div>
+    </div></div>
+    <p class="src">案Cを推奨。判断の構造化と蓄積という本来の目的と両立する唯一の案である</p>
+
+    <div class="tbl">
+    <table>
+      <caption>表4: 次にやること</caption>
+      <thead>
+        <tr><th>アクション</th><th>目的</th><th>状態</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>アーカイブ方式の実装</td><td>プロンプトに載る state を有界にする</td><td>未着手</td></tr>
+        <tr><td>刈り込み後の再計測</td><td>膨張が止まったことを数字で確認する</td><td>実装後</td></tr>
+        <tr><td>full の完走</td><td>通常の履歴運用との比較を揃える</td><td>進行中</td></tr>
+        <tr><td>未コミット分の整理</td><td>ベンチ・グラフ・キュー等の変更を履歴に残す</td><td>承認待ち</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <div class="note">刈り込みを入れずに運用を続けると、30ターン程度で state が 100KB を超え、履歴を持つより重くなる。実装は再計測より先に行う必要がある。</div>
+  </section>
+
+  <footer class="doc-footer">
+    <span>Stateful Agent 実測レポート</span>
+    <span>出所: apps/stateful-agent/.bench/turns.jsonl</span>
+  </footer>
+
+</div>
+</body>
+</html>
