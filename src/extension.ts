@@ -26,8 +26,9 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import * as vscode from "vscode";
-import { run, type Turn } from "./core/agent.js";
+import type { Turn, TurnHandlers } from "./core/agent.js";
 import { ModSurface, type ModSurfaceEvent } from "./core/modsurface.js";
+import { startSession, type AgentSession, type FollowUpStart, type TurnEnd } from "./core/session.js";
 import {
   applyEdit,
   INITIAL_STATE,
@@ -76,8 +77,16 @@ let sessionId: string | undefined;
 const toolCards = new Map<string, { name: string }>();
 
 /**
- * いまのターンの CLI につながった mod の画面要素。CLI が止まったら undefined。
- * 押されたボタンはここに渡す。前のターンの接続から遅れて届いたものはこれと比べて捨てる。
+ * いまの CLI。人の指示ごとに起動し、ターンのあとも次の指示まで残る（mod が続きのターンを始められるように）。
+ * 閉じた CLI から遅れて届いたものは、これと比べて捨てる。
+ */
+let session: AgentSession | undefined;
+/** 待機中の指示を流している最中か。続きのターンの終わりからも流すので、二重に流さない。 */
+let draining = false;
+
+/**
+ * いまの CLI につながった mod の画面要素。CLI が止まったら undefined。
+ * 押されたボタンはここに渡す。前の CLI の接続から遅れて届いたものはこれと比べて捨てる。
  */
 let modSurface: ModSurface | undefined;
 /** CLI が画面要素を断った旨は 1 度だけ出す。毎ターン出すとうるさい。 */
@@ -269,8 +278,13 @@ function budgetConfig(): ContextBudgetConfig {
   };
 }
 
-/** 規律エンジンを SDK の canUseTool に橋渡しする。 */
-function makeCanUseTool(root: string, budget: ContextBudget) {
+/**
+ * 規律エンジンを SDK の canUseTool に橋渡しする。
+ *
+ * canUseTool は CLI を起動するときに 1 度だけ渡す。CLI が自分で始めたターンでは予算を作り直すので、
+ * いまのターンの予算を budget() で引く。
+ */
+function makeCanUseTool(root: string, budget: () => ContextBudget) {
   const ruleSet = loadRuleSet(root);
   const deps = buildEngineDeps(root);
 
@@ -318,7 +332,7 @@ function makeCanUseTool(root: string, budget: ContextBudget) {
       allowed = restored;
     }
 
-    const narrowed = budget.planInput(toolName, allowed, (p) => fileFacts(root, p));
+    const narrowed = budget().planInput(toolName, allowed, (p) => fileFacts(root, p));
     if (narrowed) {
       post({ type: "rule", mark: "◧", text: narrowed.reason });
       return { behavior: "allow" as const, updatedInput: narrowed.updatedInput };
@@ -424,6 +438,18 @@ function claudeExecutable(): string | undefined {
   return p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
 }
 
+/**
+ * 履歴を捨てたとき（履歴モードの切り替え・state のリセット）に呼ぶ。
+ *
+ * 待っている CLI は前の会話を覚えているので閉じる。残すと、そこで mod が始めたターンが
+ * 古い会話のまま走り、捨てたはずの履歴とリセットした state に書き込む。走っているターンは止めない。
+ */
+function closeIdleSession(): void {
+  if (session && !session.busy) {
+    session.close();
+  }
+}
+
 /** ModSurface のイベントを Webview のメッセージに直す。 */
 function forwardModEvent(surface: ModSurface, e: ModSurfaceEvent): void {
   if (modSurface !== surface) {
@@ -462,90 +488,91 @@ function forwardModEvent(surface: ModSurface, e: ModSurfaceEvent): void {
 
 // ---------- 1ターン実行 ----------
 
-async function handleSend(text: string): Promise<void> {
-  const root = workspaceRoot();
-  if (!root) {
-    post({ type: "rule", mark: "⚠", level: "err", text: "ワークスペースが開かれていない" });
-    return;
-  }
+/** 1 ターン分の表示と計測の文脈。CLI が自分で始めたターンでも作り直す。 */
+interface TurnContext {
+  root: string;
+  mode: HistoryMode;
+  /** 履歴と実測ログに残す指示。CLI が始めたターンは、送り主と本文から作る。 */
+  instruction: string;
+  /** state フェンスを本文から外す。ターンごとに作り直す（前のターンの抑止状態を持ち越さない）。 */
+  streamFilter: StreamFilter;
+  /**
+   * context 予算。3層（隔離 / 入力を絞る / 出力を削る）を1つの会計で束ねる。
+   * ターンごとに作り直す（持ち回すと予算が枯れたまま次ターンに入る）。
+   * canUseTool と出力を削るフックの両方が同じインスタンスを見るので、層をまたいだ実績が揃う。
+   */
+  budget: ContextBudget;
+}
 
-  const mode = config<HistoryMode>("historyMode", "recent");
-  const state = loadState(root);
+function newTurn(root: string, mode: HistoryMode, instruction: string): TurnContext {
+  return { root, mode, instruction, streamFilter: new StreamFilter(), budget: new ContextBudget(budgetConfig()) };
+}
 
-  // ターンごとに作り直す。前のターンの抑止状態を持ち越さない。
-  const streamFilter = new StreamFilter();
+/** CLI が自分で始めたターンを、履歴と実測ログに残す指示の形にする。 */
+function followUpInstruction(start: FollowUpStart): string {
+  const from = start.from ?? "CLI";
+  return start.prompt ? `[${from}] ${start.prompt}` : `[${from}] （続きのターン）`;
+}
 
-  // context 予算。3層（隔離 / 入力を絞る / 出力を削る）を1つの会計で束ねる。
-  // ターンごとに作り直す（持ち回すと予算が枯れたまま次ターンに入る）。
-  // canUseTool と run の両方が同じインスタンスを見るので、層をまたいだ実績が揃う。
-  const budget = new ContextBudget(budgetConfig());
+/** ターンの出力を Webview に流す。 */
+function turnHandlers(turn: TurnContext): TurnHandlers {
+  return {
+    onText: (chunk) => {
+      // state フェンスは機械が読むもの。人が読む本文には出さない。
+      const visible = turn.streamFilter.push(chunk);
+      if (visible !== "") {
+        post({ type: "text", text: visible });
+      }
+    },
+    onToolUse: (id, name, input) => {
+      toolCards.set(id, { name });
+      // 書き換え前の内容を読んでから差分を作る（実行前なのでまだ元のまま）
+      const fp = typeof input.file_path === "string" ? input.file_path : null;
+      let before: string | null = null;
+      if (fp) {
+        try {
+          before = readFileSync(fp.startsWith("/") ? fp : join(turn.root, fp), "utf8");
+        } catch {
+          before = null; // 新規ファイル
+        }
+      }
+      const card = summarizeToolUse(name, input, before);
+      post({ type: "tool", id, tool: name, card });
+    },
+    onToolResult: (id, content, isError) => {
+      const entry = toolCards.get(id);
+      const out = entry?.name === "Bash" ? renderBashResult(content) : undefined;
+      post({ type: "toolResult", id, isError, output: out });
+      toolCards.delete(id);
+    },
+  };
+}
 
-  // 走っている間だけ保持する。stop メッセージでこれを abort する。
-  const controller = new AbortController();
-  running = controller;
-
-  // CLI はこのターンのあいだだけ生きるので、画面要素の接続もターンごとに作る。
-  // 前のターンの残り（ステータス行など）は、新しい CLI が描き直す前に消しておく
-  post({ type: "modClear" });
-  const surface: ModSurface = new ModSurface({ onEvent: (e) => forwardModEvent(surface, e) });
-  modSurface = surface;
-
+/**
+ * ターンの後処理。人の指示のターンも、CLI が自分で始めたターンも同じ。
+ *
+ * state を保存し、履歴と実測ログに残し、警告と消費を見せる。最後に done を出す。
+ */
+function finishTurn(turn: TurnContext, controller: AbortController, end: TurnEnd): void {
+  const { root, mode } = turn;
   try {
-    const result = await run({
-      spawnClaudeCodeProcess: surface.spawn,
-      pathToClaudeCodeExecutable: claudeExecutable(),
-      state,
-      instruction: text,
-      mode,
-      recentTurns: config("recentTurns", 3),
-      history,
-      cwd: root,
-      sessionId,
-      abortController: controller,
-      budget,
-      canUseTool: makeCanUseTool(root, budget) as never,
-      onText: (chunk) => {
-        // state フェンスは機械が読むもの。人が読む本文には出さない。
-        const visible = streamFilter.push(chunk);
-        if (visible !== "") {
-          post({ type: "text", text: visible });
-        }
-      },
-      onToolUse: (id, name, input) => {
-        toolCards.set(id, { name });
-        // 書き換え前の内容を読んでから差分を作る（実行前なのでまだ元のまま）
-        const fp = typeof input.file_path === "string" ? input.file_path : null;
-        let before: string | null = null;
-        if (fp) {
-          try {
-            before = readFileSync(fp.startsWith("/") ? fp : join(root, fp), "utf8");
-          } catch {
-            before = null; // 新規ファイル
-          }
-        }
-        const card = summarizeToolUse(name, input, before);
-        post({ type: "tool", id, tool: name, card });
-      },
-      onToolResult: (id, content, isError) => {
-        const entry = toolCards.get(id);
-        const out = entry?.name === "Bash" ? renderBashResult(content) : undefined;
-        post({ type: "toolResult", id, isError, output: out });
-        toolCards.delete(id);
-      },
-    });
+    if (!end.ok) {
+      throw end.error;
+    }
+    const result = end.result;
 
     sessionId = result.sessionId ?? sessionId;
     // 保留していた末尾を吐き出す（フェンスに入っていなければ本文の続き）。
-    const tail = streamFilter.flush();
+    const tail = turn.streamFilter.flush();
     if (tail !== "") {
       post({ type: "text", text: tail });
     }
 
     // 履歴に state フェンスを持ち回らせない。機械用の JSON を
     // 次ターンのプロンプトに載せるのはトークンの無駄。
-    history.push({ instruction: text, response: stripStateFence(result.response) });
+    history.push({ instruction: turn.instruction, response: stripStateFence(result.response) });
 
-    const patched = result.state !== state;
+    const patched = result.statePatched;
     if (patched) {
       saveState(root, result.state);
       post({ type: "state", rows: stateRows(result.state) });
@@ -567,7 +594,7 @@ async function handleSend(text: string): Promise<void> {
       formatRunLine(
         buildRunRecord({
           mode,
-          instruction: text,
+          instruction: turn.instruction,
           usage: result.usage,
           statePatched: patched,
           rateLimit: result.rateLimit,
@@ -618,6 +645,84 @@ async function handleSend(text: string): Promise<void> {
   }
 }
 
+async function handleSend(text: string): Promise<void> {
+  const root = workspaceRoot();
+  if (!root) {
+    post({ type: "rule", mark: "⚠", level: "err", text: "ワークスペースが開かれていない" });
+    return;
+  }
+
+  const mode = config<HistoryMode>("historyMode", "recent");
+  const state = loadState(root);
+
+  // 前の指示の CLI を閉じる。ターンのあとも残していたのは、mod が続きのターンを始められるようにするため。
+  // 次の指示は新しい CLI で始めるので、履歴を持たない前提はここで保たれる
+  session?.close();
+  // 前の CLI の残り（帯・ステータス行など）は、新しい CLI が描き直す前に消しておく
+  post({ type: "modClear" });
+
+  // 走っている間だけ running に置く。stop メッセージでこれを abort する。
+  // CLI が自分で始めたターンでも同じ controller を使う（止めると CLI ごと止まる）
+  const controller = new AbortController();
+  running = controller;
+
+  const surface: ModSurface = new ModSurface({ onEvent: (e) => forwardModEvent(surface, e) });
+  modSurface = surface;
+
+  let turn = newTurn(root, mode, text);
+  const s: AgentSession = startSession({
+    spawnClaudeCodeProcess: surface.spawn,
+    pathToClaudeCodeExecutable: claudeExecutable(),
+    state,
+    instruction: text,
+    mode,
+    recentTurns: config("recentTurns", 3),
+    history,
+    cwd: root,
+    sessionId,
+    abortController: controller,
+    budget: turn.budget,
+    canUseTool: makeCanUseTool(root, () => turn.budget) as never,
+    ...turnHandlers(turn),
+    // 続きのターンのパッチは、その時点の state に当てる（人が途中で state を編集していることがある）
+    currentState: () => loadState(root),
+    onFollowUpStart: (start) => {
+      running = controller;
+      surface.setWorking(true);
+      turn = newTurn(root, mode, followUpInstruction(start));
+      post({ type: "turnStart", from: start.from, text: start.prompt });
+      return { handlers: turnHandlers(turn), budget: turn.budget };
+    },
+    onTurnEnd: (end) => {
+      if (session !== s) {
+        // 閉じた CLI のターンは画面に出さない。done を出すと、走っている新しいターンが終わったように見える
+        return;
+      }
+      finishTurn(turn, controller, end);
+      surface.setWorking(false);
+      if (!centerPanel) {
+        s.close(); // 画面がもうないので、ボタンを押す人もいない
+      }
+      if (end.followUp) {
+        // 続きのターンの間に積まれた指示を流す。このコールバックの外で始める
+        setTimeout(() => void drainQueue(), 0);
+      }
+    },
+    onFollowUpDropped: (start) => {
+      // 承認ボタンを押した直後に次の指示を送ると、ここに来る。押したのに何も起きなかった、と見えないように残す
+      post({ type: "rule", mark: "○", text: `${start.from ?? "CLI"} が始めたターンは、次の指示を先にするため止めた` });
+    },
+    onClosed: () => {
+      if (session === s) {
+        session = undefined;
+      }
+    },
+  });
+  session = s;
+
+  await s.firstTurn;
+}
+
 /** Webview からのメッセージ処理。サイドバーとセンターで共有する。 */
 async function handleWebviewMessage(m: Record<string, unknown>): Promise<void> {
           if (m.type === "send" && typeof m.text === "string") {
@@ -636,6 +741,7 @@ async function handleWebviewMessage(m: Record<string, unknown>): Promise<void> {
               .update("historyMode", m.mode, vscode.ConfigurationTarget.Workspace);
             history.length = 0;
             sessionId = undefined;
+            closeIdleSession();
             post({ type: "meta", text: `履歴モード: ${m.mode}（履歴をクリア）` });
           }
           if (m.type === "edit") {
@@ -663,7 +769,7 @@ async function handleWebviewMessage(m: Record<string, unknown>): Promise<void> {
             // 人が Webview のボタンを押したときだけここに来る。push-gate の承認のように
             // 「人が押した」ことが前提の mod があるので、ほかの経路から ui_press を送らない
             if (!modSurface) {
-              post({ type: "rule", mark: "○", text: "このボタンはもう押せない（ターンが終わり CLI が止まった）" });
+              post({ type: "rule", mark: "○", text: "このボタンはもう押せない（描いた CLI が止まった）" });
               return;
             }
             const pressed = await modSurface.press({
@@ -691,6 +797,7 @@ async function handleWebviewMessage(m: Record<string, unknown>): Promise<void> {
               saveState(root2, { ...INITIAL_STATE });
               history.length = 0;
               sessionId = undefined;
+              closeIdleSession();
               post({ type: "state", rows: [] });
               post({ type: "meta", text: "state をリセットした" });
             }
@@ -702,16 +809,25 @@ async function handleWebviewMessage(m: Record<string, unknown>): Promise<void> {
  *
  * 1件ずつ待って流す。並行に走らせると state の書き込みが競合し、
  * 「どちらの結果が残ったか」が不定になる。
+ * 送ったあとと、CLI が自分で始めたターンのあとの両方から呼ばれるので、流している最中なら何もしない。
  */
 async function drainQueue(): Promise<void> {
-  for (;;) {
-    const next = queue.shift();
-    if (next === null) {
-      return;
+  if (draining) {
+    return;
+  }
+  draining = true;
+  try {
+    for (;;) {
+      const next = queue.shift();
+      if (next === null) {
+        return;
+      }
+      post({ type: "queued", count: queue.size, items: queue.peekAll() });
+      post({ type: "userEcho", text: next });
+      await handleSend(next);
     }
-    post({ type: "queued", count: queue.size, items: queue.peekAll() });
-    post({ type: "userEcho", text: next });
-    await handleSend(next);
+  } finally {
+    draining = false;
   }
 }
 
@@ -763,6 +879,8 @@ export function activate(context: vscode.ExtensionContext): void {
       p2.webview.onDidReceiveMessage((m) => void handleWebviewMessage(m));
       p2.onDidDispose(() => {
         centerPanel = undefined;
+        // 帯のボタンを押す画面がなくなったので、待っている CLI を止める。走っているターンは終わるのを待つ（onTurnEnd で閉じる）
+        closeIdleSession();
       });
       centerPanel = p2;
 
@@ -783,6 +901,7 @@ export function activate(context: vscode.ExtensionContext): void {
           .update("historyMode", picked, vscode.ConfigurationTarget.Workspace);
         history.length = 0;
         sessionId = undefined;
+        closeIdleSession();
       }
     }),
     vscode.commands.registerCommand("statefulAgent.showMetrics", () => {
@@ -813,6 +932,7 @@ export function activate(context: vscode.ExtensionContext): void {
         saveState(root, { ...INITIAL_STATE });
         history.length = 0;
         sessionId = undefined;
+        closeIdleSession();
         post({ type: "state", rows: [] });
       }
     }),
@@ -820,6 +940,8 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {
+  session?.close();
+  session = undefined;
   centerPanel = undefined;
   graphPanel = undefined;
 }

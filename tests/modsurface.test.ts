@@ -146,6 +146,32 @@ describe("ModSurface: 描く", () => {
     expect(trees(events)[0]).toEqual({ kind: "tree", site: "band", id: BAND_ID, tree: BAND_TREE });
   });
 
+  it("ターンの終わりと始まりで、帯を isWorking を変えて描き直す", async () => {
+    const { cli, events, surface } = setup();
+    cli.initialized();
+    await vi.waitFor(() => expect(trees(events)).toHaveLength(1));
+    expect(cli.of("ui_render")[0]).toMatchObject({ props: { isWorking: true } });
+
+    surface.setWorking(false);
+    await vi.waitFor(() => expect(cli.of("ui_render")).toHaveLength(2));
+    expect(cli.of("ui_render")[1]).toMatchObject({ component: "AbovePrompt", props: { isWorking: false } });
+
+    // 変わらなければ頼まない
+    surface.setWorking(false);
+    surface.setWorking(true);
+    await vi.waitFor(() => expect(cli.of("ui_render")).toHaveLength(3));
+    expect(cli.of("ui_render")[2]).toMatchObject({ props: { isWorking: true } });
+  });
+
+  it("名乗る前に setWorking しても ui_render は送らず、名乗ったあとの帯に反映する", async () => {
+    const { cli, events, surface } = setup();
+    surface.setWorking(false);
+    cli.initialized();
+    await vi.waitFor(() => expect(trees(events)).toHaveLength(1));
+    expect(cli.of("ui_render")).toHaveLength(1);
+    expect(cli.of("ui_render")[0]).toMatchObject({ props: { isWorking: false } });
+  });
+
   it("mod が CLI に任せた帯（engine）は tree:null", async () => {
     const { cli, events } = setup((req) =>
       req.subtype === "ui_render" ? { ok: { tree: { type: "engine", ref: 1 }, hooked: true } } : cli289(req),

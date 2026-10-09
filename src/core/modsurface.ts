@@ -7,8 +7,9 @@
  * - stdout: 自分が送った要求への返答だけを抜き取り、残りはそのまま SDK に渡す。
  *           トーストなどの通知は SDK にも渡る（SDK は知らない subtype を読み流す）
  *
- * いまの stateful-agent は 1 ターンごとに CLI を起動し、ターンが終わると CLI も止まる。
- * なので画面要素はターン中だけ生きている。止まったら closed を出し、画面側は消す。
+ * CLI は人の指示ごとに起動し、ターンのあとも次の指示まで残る（session.ts）。
+ * なので画面要素はターンのあとも押せる。push-gate の承認ボタンはターンが終わってから押される。
+ * CLI が止まったら closed を出し、画面側は消す。
  *
  * ui_press は人がボタンを押したときだけ呼ぶ。push-gate の承認のように「人が押した」ことが
  * 前提の mod があるので、モデルや自動処理からは呼ばない。
@@ -80,6 +81,8 @@ export class ModSurface {
   private readonly dirty = new Set<string>();
   private readonly viewport: { columns: number; rows: number };
   private readonly clientId: string;
+  /** ターンが走っているか。帯の props（isWorking）で mod に伝える。CLI はターンを始めるときに起動する。 */
+  private working = true;
 
   constructor(private readonly opts: ModSurfaceOptions) {
     this.viewport = opts.viewport ?? { columns: 100, rows: 30 };
@@ -142,6 +145,17 @@ export class ModSurface {
       this.renderAll();
     }
     return handled;
+  }
+
+  /** ターンの始まりと終わりを伝える。変わったら帯を描き直す（isWorking を見て描き分ける mod がある）。 */
+  setWorking(working: boolean): void {
+    if (this.working === working) {
+      return;
+    }
+    this.working = working;
+    if (this.phase === "attached") {
+      this.render({ component: "AbovePrompt" });
+    }
   }
 
   // ---------- stdout ----------
@@ -327,8 +341,7 @@ export class ModSurface {
     const maxRows = 10;
     return {
       hasSurvey: false,
-      // CLI が生きているのはターン中だけなので、描くときはいつも作業中
-      isWorking: true,
+      isWorking: this.working,
       maxRows,
       // 右端の 5 マスは CLI の印（[-]）の場所として空ける決まり
       bodyColumns: this.viewport.columns - 5,

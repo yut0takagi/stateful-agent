@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { parseNotice, routeLine, textOf, treeOf } from "../src/core/modui.js";
+import { parseNotice, routeLine, textOf, treeOf, unwrapPluginPrompt } from "../src/core/modui.js";
 
 const PREFIX = "stateful_agent_ui_";
 
@@ -111,5 +111,20 @@ describe("treeOf / textOf", () => {
   it("木の無い返答は null", () => {
     expect(treeOf(undefined)).toBeNull();
     expect(treeOf({ hooked: false })).toBeNull();
+  });
+});
+
+describe("unwrapPluginPrompt", () => {
+  it("CLI が包んだ文面から、mod が書いた本文だけを取り出す（2.1.295 の実物）", () => {
+    const wrapped =
+      "The push-gate plugin sent a message:\npush-gate: 承認しました。次のコマンドを、書き換えずにそのまま実行してください。\n\n```sh\ngit push origin main\n```\n\n" +
+      "This is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";
+    expect(unwrapPluginPrompt(wrapped)).toBe(
+      "push-gate: 承認しました。次のコマンドを、書き換えずにそのまま実行してください。\n\n```sh\ngit push origin main\n```",
+    );
+  });
+
+  it("文面が変わって当てはまらなければ、そのまま返す", () => {
+    expect(unwrapPluginPrompt("push-gate: 承認しました。")).toBe("push-gate: 承認しました。");
   });
 });

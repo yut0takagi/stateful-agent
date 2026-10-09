@@ -72,6 +72,13 @@ describe("buildSdkOptions", () => {
     const o = buildSdkOptions({ cwd: "/repo", mode: "full" });
     expect(o.resume).toBeUndefined();
   });
+
+  it("replayUserMessages で --replay-user-messages を付ける。既定では付けない", () => {
+    expect(buildSdkOptions({ cwd: "/repo", mode: "stateless", replayUserMessages: true }).extraArgs).toEqual({
+      "replay-user-messages": null,
+    });
+    expect(buildSdkOptions({ cwd: "/repo", mode: "stateless" }).extraArgs).toBeUndefined();
+  });
 });
 
 describe("extractStreamText", () => {

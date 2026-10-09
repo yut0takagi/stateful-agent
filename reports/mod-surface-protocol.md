@@ -172,7 +172,7 @@ no attached surface places panes (stateful-agent-probe): placed when a surface t
 
 ## 手順 3 の進み具合（2026-10-09）
 
-手順 3 は 2 段に分けた。段階 A では、いまの作り（1 ターンごとに CLI を起動する）のまま、ターン中に届く画面要素を描く。段階 B で、ターンのあとも CLI を残す作りに変える。段階 A まで終わった。
+手順 3 は 2 段に分けた。段階 A では、いまの作り（1 ターンごとに CLI を起動する）のまま、ターン中に届く画面要素を描く。段階 B で、ターンのあとも CLI を残す作りに変える。段階 A の結果をこの節に、段階 B の結果を次の節に書いた。
 
 ### 組み込む前に分かったこと
 
@@ -205,6 +205,88 @@ no attached surface places panes (stateful-agent-probe): placed when a surface t
 - プロンプトを文字列から AsyncIterable に変え、`result` のあとも stdin を閉じない。次のターンを始めるとき（または拡張を閉じるとき）に古い CLI を閉じ、新しく起動する。これで履歴を持たない前提は保たれる
 - mod が `$.prompt.submit()` で始めたターン（push-gate の承認後の続き）は古い CLI の中で動く。その出力の表示と state パッチの適用を受ける口を作る
 - 帯の `isWorking` は、いまは常に `true` で送っている。ターンのあとも CLI を残すなら、ターン中かどうかで切り替える
+
+## 手順 3 段階 B の結果（2026-10-10）
+
+ターンのあとも CLI を残す作りに変え、push-gate の承認を通しで動かした。拒否のあとで帯の「承認」を押すと、`$.prompt.submit()` で続きのターンが走り、push が通る。ここまでを、本物の SDK と CLI のうえと、VS Code の画面の両方で確かめた。
+
+### 組み込む前に確かめたこと
+
+CLI 2.1.295 を stream-json で起動し、push-gate を読み込ませて、一時フォルダの git リポジトリで `git push` を頼んだ。push 先は、同じ一時フォルダに置いた bare リポジトリにした。SDK と同じ条件にするため、`--permission-prompt-tool=stdio` を付けて `can_use_tool` に答え、`CLAUDE_CODE_SDK_READS_SESSION_STATE=1` を渡した。使ったスクリプトは `reports/probes/probe-prompt-submit.mjs`。
+
+1. **承認を押すと、CLI は自分でターンを始める。** stdout には次の順に流れた。
+
+   ```text
+   ui_invalidate → session_state_changed:running → command_lifecycle(started) → system/init
+   → （再生されたプロンプト）→ 応答 → result → command_lifecycle(completed) → session_state_changed:idle
+   ```
+
+2. **続きのターンの Bash も `can_use_tool` を通る。** なので stateful-agent の規律エンジン（canUseTool）は、続きのターンのツール呼び出しも判定する。push-gate の拒否は `can_use_tool` より前に起きる。拒否したときは `can_use_tool` が来ない
+3. **mod が積んだプロンプトは、既定では stdout に出ない。** `--replay-user-messages` を付けると、`origin` 付きの user メッセージとして届く。プロンプトの本文は、CLI が次の文面で包んでいる
+
+   ```json
+   {"type":"user","message":{"role":"user","content":"The push-gate plugin sent a message:\npush-gate: 承認しました。…\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above."},"isReplay":true,"origin":{"kind":"plugin","name":"push-gate"}}
+   ```
+
+   SDK 0.3.295 の型（`SDKMessageOrigin`）には、`kind: "plugin"` がない
+4. **再生されたプロンプトは、続きのターンの応答より先に届く。** `--include-partial-messages` を付けても、`message_start` より前に届いた。送り主とプロンプトを画面に出してから、続きのターンの応答を流せる
+5. **`--replay-user-messages` を付けると、ホストが返した `control_response`（`can_use_tool` への答え）も stdout に戻ってくる。** SDK は、知らない request_id への返答として上限つきの表にしまうだけで、ModSurface も読み流す。害はない
+6. **承認のあとの帯は `engine`（mod が CLI に任せた印）に戻る。** push-gate が承認待ちを消したため
+
+SDK 側の挙動は、ソース（`sdk.mjs`）を読んで確かめた。
+
+- プロンプトが文字列だと、SDK は最初の `result` で stdin を閉じる（`isSingleUserTurn`）。AsyncIterable なら、入力が終わるまで閉じない。入力が終わると、走っているターンの終わりを待ってから閉じる
+- SDK は CLI に `CLAUDE_CODE_SDK_READS_SESSION_STATE=1` を渡し、`session_state_changed:idle` でターンの終わりを知る。この通知には `sdk_host_only` が付いていて、SDK が捨てる。`query()` を使う側には届かない
+- `command_lifecycle` と `system/init` は、`query()` を使う側に届く
+
+### 作ったもの
+
+| ファイル | 役目 |
+|---|---|
+| `src/core/session.ts`（新規） | `startSession`。プロンプトを AsyncIterable で渡し、`result` のあとも stdin を開けておく。ターンの外で、`origin` 付きの再生されたプロンプトか応答が届いたら、続きのターンとして切り出す。`close()` は、ターンの外なら stdin を閉じて CLI に自分で止まらせ、ターン中なら打ち切る。閉じると決めたあとで CLI が始めたターンも打ち切る |
+| `src/core/agent.ts` | 1 ターン分の読み取りを `TurnReader` に、後処理を `toRunResult` に切り出した。`run()`（ベンチが使う 1 ターン版）の挙動は変えていない。`buildSdkOptions` に `replayUserMessages` を、`RunResult` に `statePatched` を足した |
+| `src/core/modsurface.ts` | `setWorking()` で帯の `isWorking` を切り替え、変わったら帯を描き直す |
+| `src/core/modui.ts` | `unwrapPluginPrompt()` で、CLI の包みから mod が書いた本文を取り出す。文面が変わって当てはまらなければ、包みごと返す |
+| `src/extension.ts` | `startSession` を使う形に書き換えた。ターンの後処理（state の保存・履歴・実測ログ・警告）を `finishTurn` にまとめ、人の指示のターンと続きのターンで同じものを使う。続きのターンの間に送られた指示は待たせ、終わったら流す |
+| `src/webview` | `turnStart` を受けて「push-gate が続きのターンを始めた」とプロンプトの本文を出し、作業中の表示にする |
+
+段階 A から持ち越した 3 点は、次のように片づけた。
+
+- プロンプトを AsyncIterable で渡し、`result` のあとも stdin を開けておくようにした。次の指示を始めるときに古い CLI を閉じ、新しく起動する
+- 続きのターンの応答は、人の指示のターンと同じ形で Webview に流す。state パッチは、続きのターンが終わった時点の state に当てる。人が途中で state を編集していることがあるため
+- 帯の `isWorking` は、ターンの始まりと終わりで切り替える
+
+組み込むときに、次のことを決めた。
+
+- 続きのターンでは context 予算を作り直す。canUseTool と出力を削るフックは、CLI の起動時に 1 度だけ渡す。そこで、渡す関数がいまのターンの予算を見るようにした
+- 続きのターンも、recent モードの履歴と実測ログに残す。指示の欄には `[push-gate] push-gate: 承認しました。…` のように、送り主とプロンプトの本文を入れる
+- 履歴を捨てる操作では、待っている CLI も閉じる。履歴モードの切り替えと state のリセットが当たる。CLI は前の会話を覚えているので、残すと、捨てた会話の続きがリセットした state に書き込まれる
+- 承認を押した直後に次の指示を送ったら、次の指示を先にする。CLI が始めかけた続きのターンは打ち切り、そのことを画面に 1 行出す
+- パネルを閉じたら、待っている CLI も閉じる。ボタンを押す画面がなくなるため。ターンが走っていれば、終わってから閉じる
+- 続きのターンの間に止めると、CLI ごと止まる。人の指示のターンと同じ controller で abort するため
+
+### 確かめたこと
+
+- **テスト:** `tests/session.test.ts` に 14 件を、`modsurface`・`modui`・`agent` のテストに合わせて 5 件を足した。全 408 件が通り、typecheck とビルドも通った。skip の 6 件は、vault がないときに飛ばす既存のテスト
+- **本物の SDK と CLI での通し:** `startSession` と `ModSurface` を、SDK 0.3.295・同梱 CLI 2.1.295・push-gate で動かした。使ったスクリプトは `reports/probes/e2e-push-gate.ts`。人がボタンを押す代わりに、スクリプトが帯の「承認」を `ModSurface.press()` で押した。結果は次のとおり
+  1. 人の指示のターンで、push-gate が `git push` を拒否し、帯に「承認」「却下」が出た。ターンが終わっても CLI は残った（`busy` は false）
+  2. 「承認」を押すと `handled: true` が返り、帯は消えた
+  3. 続きのターンが始まり、送り主 `push-gate` とプロンプトの本文（`push-gate: 承認しました。…`）を受け取った
+  4. 続きのターンの `git push` は canUseTool を通って成功し、bare リポジトリに `main` ができた。state パッチも当たった
+  5. `close()` の約 1 秒後に、CLI が自分で止まって `closed` が出た
+- **CLI の版:** 同じスクリプトを CLI 2.1.294 と 2.1.289 でも動かし、2.1.295 と同じ結果になった
+- **VS Code の画面:** 本家の VS Code 1.141.0 を、一時の user-data-dir と空の extensions-dir で別に起動し、この拡張を Extension Development Host として読み込んだ。VS Code では、一時フォルダの git リポジトリを開いた（push 先は同じ一時フォルダの bare リポジトリ）。Playwright で CDP につなぎ、Webview の入力欄とボタンを操作した。CLI は `statefulAgent.claudeExecutable` に置いた起動スクリプトから起動した。スクリプトは同梱 CLI 2.1.295 に `--plugin-dir`（push-gate）・`--setting-sources project`・`--model haiku` を足して呼ぶ。人が押す代わりに、Playwright が帯の「承認」を押した。結果は次のとおり
+  1. 中央パネルから push を頼むと、push-gate が拒否し、入力欄の上に帯（「⏸ push-gate: 承認待ち（git push）」と「承認」「却下」）が出た。ターンが終わっても帯は残った
+  2. 「承認」を押すと、「↻ push-gate が続きのターンを始めた」とプロンプトの本文が出た。続きのターンの間は、入力欄が「実行中（送ると順番待ちに入る）」になり、中断ボタンが出た
+  3. 続きのターンの `git push` のカードが成功になり、応答と消費の行が出た。帯は消え、state の「次の一手」も更新された。bare リポジトリに `main` ができた
+  4. 次の指示を送ると、古い CLI が止まり、新しい CLI に入れ替わった（プロセスを数えて確かめた）。新しい CLI は前の会話を持っていなかった
+  5. VS Code を閉じると、待っていた CLI も止まった
+
+### 残る点
+
+- `origin.kind` が `plugin` 以外の続きのターン（バックグラウンドのタスクの知らせなど）は、送り主の欄に種類を出すだけにした。実物ではまだ見ていない
+- 続きのターンの始まりに出すプロンプトの本文は、地の文として出している。push-gate の本文にあるコードブロックは、`` ```sh `` の記号のまま見える
+- 画面の確認では、段階 B と関係のない表示の不具合を 2 つ見た。state の欄で、「決定」「未決」の各項目が `[object Object]` と出る。見出しの規律の数が「読み込み中」のまま変わらない
 
 ## 注意点
 
