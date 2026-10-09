@@ -12,7 +12,9 @@ import { ChatMessage, TypingIndicator } from "./ui/message.js";
 import { ToolCardView } from "./ui/tool-card.js";
 import { StatePanel } from "./ui/state-panel.js";
 import { Composer } from "./ui/composer.js";
+import { ModSurfaceView, type ModPaneView } from "./ui/mod-surface.js";
 import type { ToolCard } from "../core/toolview.js";
+import type { UiElement } from "../core/modui.js";
 import type { ClientMessage, HistoryMode, HostMessage, StateRow } from "./types.js";
 import { cn } from "./lib/utils.js";
 
@@ -37,6 +39,13 @@ export function App() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [queuedItems, setQueuedItems] = useState<string[]>([]);
+
+  // mod の画面要素。CLI が生きているターン中だけ描き、modClear で消す
+  const [modBand, setModBand] = useState<UiElement | null>(null);
+  const [modPanes, setModPanes] = useState<ModPaneView[]>([]);
+  const [modShownId, setModShownId] = useState<string | null>(null);
+  const [modStatus, setModStatus] = useState<Record<string, string>>({});
+  const [modToasts, setModToasts] = useState<Array<{ id: number; plugin: string; text: string }>>([]);
 
   // done ハンドラは初回の値を掴んだままなので、最新の待機件数は ref で見る
   const queuedRef = useRef(0);
@@ -120,6 +129,42 @@ export function App() {
           ...prev,
           { kind: "msg", id: ++seq, isUser: true, text: m.text, streaming: false },
         ]);
+      }
+
+      if (m.type === "modTree") {
+        if (m.site === "band") {
+          setModBand(m.tree);
+        } else {
+          setModPanes((prev) => prev.map((p) => (p.id === m.id ? { ...p, tree: m.tree } : p)));
+        }
+      }
+      if (m.type === "modPanes") {
+        // 一覧は毎回全量で届く。描いてあった中身は id で引き継ぐ
+        setModPanes((prev) => m.panes.map((p) => ({ ...p, tree: prev.find((q) => q.id === p.id)?.tree ?? null })));
+        setModShownId(m.shownId);
+      }
+      if (m.type === "modStatus") {
+        setModStatus((prev) => {
+          const next = { ...prev };
+          if (m.text === null) {
+            delete next[m.plugin];
+          } else {
+            next[m.plugin] = m.text;
+          }
+          return next;
+        });
+      }
+      if (m.type === "modToast") {
+        const id = ++seq;
+        setModToasts((prev) => [...prev, { id, plugin: m.plugin, text: m.text }]);
+        setTimeout(() => setModToasts((prev) => prev.filter((t) => t.id !== id)), m.timeoutMs);
+      }
+      if (m.type === "modClear") {
+        // トーストは時間で消えるので残す。帯・ペイン・ステータス行は押せる相手がもういない
+        setModBand(null);
+        setModPanes([]);
+        setModShownId(null);
+        setModStatus({});
       }
 
       if (m.type === "done") {
@@ -230,6 +275,17 @@ export function App() {
 
         {busy && !items.some((i) => i.kind === "msg" && i.streaming) && <TypingIndicator />}
       </div>
+
+      <ModSurfaceView
+        band={modBand}
+        panes={modPanes}
+        shownId={modShownId}
+        status={modStatus}
+        toasts={modToasts}
+        onPress={(ref) => send({ type: "modPress", plugin: ref.plugin, handle: ref.handle, ...(ref.key ? { key: ref.key } : {}) })}
+        onShowPane={setModShownId}
+        onDismissToast={(id) => setModToasts((prev) => prev.filter((t) => t.id !== id))}
+      />
 
       <Composer
         value={input}

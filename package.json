@@ -147,6 +147,11 @@
           "type": "number",
           "default": 40000,
           "description": "[3] 1ターンのツール出力合計の上限（文字）。超えると以降を強く絞る"
+        },
+        "statefulAgent.claudeExecutable": {
+          "type": "string",
+          "default": "",
+          "description": "使う Claude Code CLI の場所（例: ~/.local/bin/claude）。空なら SDK に同梱の CLI を使う。mod の画面要素（帯・ペイン・ボタン）は CLI 2.1.289 以降で動く"
         }
       }
     }
@@ -161,7 +166,7 @@
     "bench": "node dist/bench.mjs"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.266",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.295",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.43.0",

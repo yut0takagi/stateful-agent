@@ -61,7 +61,13 @@ export interface RunOptions {
    * 省略すると全層なしで従来どおり動く。ターンごとに作り直す。
    */
   budget?: ContextBudget;
+  /** CLI の起動を差し替える。mod の画面要素をつなぐときに使う（modsurface.ts）。 */
+  spawnClaudeCodeProcess?: SdkOptions["spawnClaudeCodeProcess"];
+  /** 使う CLI の場所。省略すると SDK に同梱の CLI を使う。 */
+  pathToClaudeCodeExecutable?: string;
 }
+
+type SdkOptions = NonNullable<Parameters<typeof QueryFn>[0]["options"]>;
 
 export interface RunResult {
   response: string;
@@ -224,6 +230,8 @@ export interface SdkOptionInput {
   budget?: ContextBudget;
   /** 調査を隔離するターンか。agents を載せるかの判断に使う。 */
   isolating?: boolean;
+  spawnClaudeCodeProcess?: RunOptions["spawnClaudeCodeProcess"];
+  pathToClaudeCodeExecutable?: string;
 }
 
 /**
@@ -284,6 +292,8 @@ export function buildSdkOptions(input: SdkOptionInput): Record<string, unknown> 
     ...(input.mode === "full" && input.sessionId ? { resume: input.sessionId } : {}),
     ...(input.canUseTool ? { canUseTool: input.canUseTool } : {}),
     ...(input.abortController ? { abortController: input.abortController } : {}),
+    ...(input.spawnClaudeCodeProcess ? { spawnClaudeCodeProcess: input.spawnClaudeCodeProcess } : {}),
+    ...(input.pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable } : {}),
   };
 }
 
@@ -384,6 +394,8 @@ export async function run(opts: RunOptions): Promise<RunResult> {
     abortController: opts.abortController,
     budget: opts.budget,
     isolating,
+    spawnClaudeCodeProcess: opts.spawnClaudeCodeProcess,
+    pathToClaudeCodeExecutable: opts.pathToClaudeCodeExecutable,
   });
 
   let response = "";
