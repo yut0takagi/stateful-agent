@@ -27,7 +27,7 @@ import { DELEGATE_HINT, toAgentsOption } from "./explorer.js";
  * 静的 import は require に落ちて壊れるので、動的 import で読む。
  * esbuild が変換してしまわないよう Function 経由にする。
  */
-const importSdk = new Function(
+export const importSdk = new Function(
   'return import("@anthropic-ai/claude-agent-sdk")',
 ) as () => Promise<{ query: typeof QueryFn }>;
 
@@ -37,7 +37,20 @@ export interface Turn {
   response: string;
 }
 
-export interface RunOptions {
+/** 1 ターン分の出力の受け口。CLI が自分で始めたターン（session.ts）でも同じ形で受け取る。 */
+export interface TurnHandlers {
+  /** ストリーミング中のテキストを逐次受け取る。 */
+  onText?: (chunk: string) => void;
+  /** ツール呼び出しを受け取る（チャットにカードとして埋め込むため）。 */
+  onToolUse?: (id: string, name: string, input: Record<string, unknown>) => void;
+  /** ツール結果を受け取る。 */
+  onToolResult?: (id: string, content: string, isError: boolean) => void;
+}
+
+/** ツール出力を削る口。PostToolUse フックはこれだけを使う。 */
+export type OutputBudget = Pick<ContextBudget, "applyOutput">;
+
+export interface RunOptions extends TurnHandlers {
   state: AgentState;
   instruction: string;
   mode: HistoryMode;
@@ -50,12 +63,6 @@ export interface RunOptions {
   sessionId?: string;
   canUseTool?: NonNullable<Parameters<typeof QueryFn>[0]["options"]>["canUseTool"];
   abortController?: AbortController;
-  /** ストリーミング中のテキストを逐次受け取る。 */
-  onText?: (chunk: string) => void;
-  /** ツール呼び出しを受け取る（チャットにカードとして埋め込むため）。 */
-  onToolUse?: (id: string, name: string, input: Record<string, unknown>) => void;
-  /** ツール結果を受け取る。 */
-  onToolResult?: (id: string, content: string, isError: boolean) => void;
   /**
    * context 予算。3層（隔離 / 入力を絞る / 出力を削る）を束ねたもの。
    * 省略すると全層なしで従来どおり動く。ターンごとに作り直す。
@@ -73,6 +80,8 @@ export interface RunResult {
   response: string;
   /** 応答から取り出した state パッチを適用した結果。 */
   state: AgentState;
+  /** パッチが返ったか。false なら state は渡したまま。 */
+  statePatched: boolean;
   sessionId?: string;
   usage?: TurnUsage;
   rateLimit?: unknown;
@@ -226,12 +235,17 @@ export interface SdkOptionInput {
   sessionId?: string;
   canUseTool?: RunOptions["canUseTool"];
   abortController?: AbortController;
-  /** context 予算。渡すと PostToolUse で出力を削り、隔離時は agents を載せる。 */
-  budget?: ContextBudget;
+  /** context 予算。渡すと PostToolUse で出力を削る。 */
+  budget?: OutputBudget;
   /** 調査を隔離するターンか。agents を載せるかの判断に使う。 */
   isolating?: boolean;
   spawnClaudeCodeProcess?: RunOptions["spawnClaudeCodeProcess"];
   pathToClaudeCodeExecutable?: string;
+  /**
+   * CLI が受けたプロンプトを stdout にも流させる（--replay-user-messages）。
+   * mod が $.prompt.submit() で積んだプロンプトは、これがないと本文も送り主も見えない（実測）。
+   */
+  replayUserMessages?: boolean;
 }
 
 /**
@@ -242,7 +256,7 @@ export interface SdkOptionInput {
  * 並行して走る他フックの差し替えと last-write-wins で競合し、
  * 本物の削減を打ち消しうる（SDK の型注記が明示している）。
  */
-export function buildPostToolUseHook(budget: ContextBudget) {
+export function buildPostToolUseHook(budget: OutputBudget) {
   return async (input: unknown): Promise<Record<string, unknown>> => {
     const i = input as { tool_name?: string; tool_response?: unknown };
     if (typeof i.tool_name !== "string") {
@@ -294,6 +308,7 @@ export function buildSdkOptions(input: SdkOptionInput): Record<string, unknown> 
     ...(input.abortController ? { abortController: input.abortController } : {}),
     ...(input.spawnClaudeCodeProcess ? { spawnClaudeCodeProcess: input.spawnClaudeCodeProcess } : {}),
     ...(input.pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable } : {}),
+    ...(input.replayUserMessages ? { extraArgs: { "replay-user-messages": null } } : {}),
   };
 }
 
@@ -377,49 +392,27 @@ export function extractUsage(
   };
 }
 
-/** SDK を1ターン実行する。 */
-export async function run(opts: RunOptions): Promise<RunResult> {
-  const recent = selectHistory(opts.mode, opts.history, opts.recentTurns);
-  // [1] 調査なら explorer に投げるよう主スレッドに伝える。
-  // agents を定義しただけでは使われない。
-  const isolating = opts.budget?.planIsolation(opts.instruction) ?? false;
-  const prompt =
-    buildPrompt(opts.state, opts.instruction, recent) + (isolating ? DELEGATE_HINT : "");
+/**
+ * 1 ターン分のメッセージを読み、本文・ツール・消費を積む。
+ *
+ * 人の指示のターンも、CLI が自分で始めたターン（mod の $.prompt.submit など）も同じ形で読む。
+ * system/init と rate_limit_event はターンの外でも届くので、ここでは読まない（呼び出し側で拾う）。
+ */
+export class TurnReader {
+  response = "";
+  usage: TurnUsage | undefined;
 
-  const sdkOptions = buildSdkOptions({
-    cwd: opts.cwd,
-    mode: opts.mode,
-    sessionId: opts.sessionId,
-    canUseTool: opts.canUseTool,
-    abortController: opts.abortController,
-    budget: opts.budget,
-    isolating,
-    spawnClaudeCodeProcess: opts.spawnClaudeCodeProcess,
-    pathToClaudeCodeExecutable: opts.pathToClaudeCodeExecutable,
-  });
+  constructor(private readonly handlers: TurnHandlers) {}
 
-  let response = "";
-  let sessionId: string | undefined;
-  let usage: RunResult["usage"];
-  let rateLimit: unknown;
-
-  const { query } = await importSdk();
-
-  for await (const message of query({ prompt, options: sdkOptions as never })) {
-    const m = message as Record<string, unknown>;
-
-    if (m.type === "system" && m.subtype === "init") {
-      sessionId = m.session_id as string | undefined;
-      continue;
-    }
-
+  /** 1 メッセージを読む。ターンが終わった（result）なら true。 */
+  read(m: Record<string, unknown>): boolean {
     // ストリーミング中の差分。表示はこちらが担う。
     if (m.type === "stream_event") {
       const chunk = extractStreamText(m.event);
       if (chunk !== null) {
-        opts.onText?.(chunk);
+        this.handlers.onText?.(chunk);
       }
-      continue;
+      return false;
     }
 
     if (m.type === "assistant") {
@@ -429,16 +422,16 @@ export async function run(opts: RunOptions): Promise<RunResult> {
         // 確定した本文を response に積む。表示は stream_event が済ませているので
         // ここで onText は呼ばない（呼ぶと同じ文が二重に出る）。
         if (b.type === "text" && typeof b.text === "string") {
-          response += b.text;
+          this.response += b.text;
         }
         if (b.type === "tool_use") {
           const t = block as { id?: string; name?: string; input?: unknown };
           if (typeof t.id === "string" && typeof t.name === "string") {
-            opts.onToolUse?.(t.id, t.name, (t.input as Record<string, unknown>) ?? {});
+            this.handlers.onToolUse?.(t.id, t.name, (t.input as Record<string, unknown>) ?? {});
           }
         }
       }
-      continue;
+      return false;
     }
 
     // ツール結果は user ロールで返ってくる。
@@ -453,10 +446,89 @@ export async function run(opts: RunOptions): Promise<RunResult> {
             is_error?: boolean;
           };
           if (b.type === "tool_result" && typeof b.tool_use_id === "string") {
-            opts.onToolResult?.(b.tool_use_id, stringifyResult(b.content), b.is_error === true);
+            this.handlers.onToolResult?.(b.tool_use_id, stringifyResult(b.content), b.is_error === true);
           }
         }
       }
+      return false;
+    }
+
+    if (m.type === "result") {
+      this.usage = extractUsage(
+        m.usage as Record<string, number> | undefined,
+        m.total_cost_usd as number | undefined,
+      );
+      return true;
+    }
+
+    return false;
+  }
+}
+
+/** 読み終えたターンから結果を作る。state パッチはここで当てる。 */
+export function toRunResult(
+  state: AgentState,
+  reader: TurnReader,
+  extra: { sessionId?: string; rateLimit?: unknown; budget?: ContextBudget },
+): RunResult {
+  const patched = processPatch(state, reader.response);
+  const summary = extra.budget?.summary();
+
+  return {
+    response: reader.response,
+    state: patched.state,
+    statePatched: patched.patched,
+    sessionId: extra.sessionId,
+    usage: reader.usage,
+    rateLimit: extra.rateLimit,
+    stateWarnings: patched.warnings,
+    ...(summary !== null && summary !== undefined ? { budgetSummary: summary } : {}),
+  };
+}
+
+/** 指示から、CLI に渡すプロンプトと、調査を隔離するかを決める。 */
+export function preparePrompt(opts: RunOptions): { prompt: string; isolating: boolean } {
+  const recent = selectHistory(opts.mode, opts.history, opts.recentTurns);
+  // [1] 調査なら explorer に投げるよう主スレッドに伝える。
+  // agents を定義しただけでは使われない。
+  const isolating = opts.budget?.planIsolation(opts.instruction) ?? false;
+  const prompt =
+    buildPrompt(opts.state, opts.instruction, recent) + (isolating ? DELEGATE_HINT : "");
+  return { prompt, isolating };
+}
+
+/**
+ * SDK を1ターン実行する。
+ *
+ * プロンプトを文字列で渡すので、SDK は最初の result で stdin を閉じ、CLI もそこで止まる。
+ * ターンのあとも CLI を残したいときは session.ts の startSession を使う。
+ */
+export async function run(opts: RunOptions): Promise<RunResult> {
+  const { prompt, isolating } = preparePrompt(opts);
+
+  const sdkOptions = buildSdkOptions({
+    cwd: opts.cwd,
+    mode: opts.mode,
+    sessionId: opts.sessionId,
+    canUseTool: opts.canUseTool,
+    abortController: opts.abortController,
+    budget: opts.budget,
+    isolating,
+    spawnClaudeCodeProcess: opts.spawnClaudeCodeProcess,
+    pathToClaudeCodeExecutable: opts.pathToClaudeCodeExecutable,
+  });
+
+  const reader = new TurnReader(opts);
+  let sessionId: string | undefined;
+  let rateLimit: unknown;
+
+  const { query } = await importSdk();
+
+  for await (const message of query({ prompt, options: sdkOptions as never })) {
+    const m = message as Record<string, unknown>;
+
+    if (m.type === "system" && m.subtype === "init") {
+      sessionId = m.session_id as string | undefined;
       continue;
     }
 
@@ -465,24 +537,8 @@ export async function run(opts: RunOptions): Promise<RunResult> {
       continue;
     }
 
-    if (m.type === "result") {
-      usage = extractUsage(
-        m.usage as Record<string, number> | undefined,
-        m.total_cost_usd as number | undefined,
-      );
-    }
+    reader.read(m);
   }
 
-  const patched = processPatch(opts.state, response);
-  const summary = opts.budget?.summary();
-
-  return {
-    response,
-    state: patched.state,
-    sessionId,
-    usage,
-    rateLimit,
-    stateWarnings: patched.warnings,
-    ...(summary !== null && summary !== undefined ? { budgetSummary: summary } : {}),
-  };
+  return toRunResult(opts.state, reader, { sessionId, rateLimit, budget: opts.budget });
 }

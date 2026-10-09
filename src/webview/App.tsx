@@ -40,7 +40,7 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [queuedItems, setQueuedItems] = useState<string[]>([]);
 
-  // mod の画面要素。CLI が生きているターン中だけ描き、modClear で消す
+  // mod の画面要素。CLI が生きている間（次の指示まで）描き、modClear で消す
   const [modBand, setModBand] = useState<UiElement | null>(null);
   const [modPanes, setModPanes] = useState<ModPaneView[]>([]);
   const [modShownId, setModShownId] = useState<string | null>(null);
@@ -129,6 +129,16 @@ export function App() {
           ...prev,
           { kind: "msg", id: ++seq, isUser: true, text: m.text, streaming: false },
         ]);
+      }
+
+      // 人が送っていないターン。誰が何を頼んだかを残し、走っている間は送った指示を待たせる
+      if (m.type === "turnStart") {
+        const head = `${m.from ?? "CLI"} が続きのターンを始めた`;
+        setItems((prev) => [
+          ...prev,
+          { kind: "note", id: ++seq, mark: "↻", text: m.text ? `${head}\n${m.text}` : head },
+        ]);
+        setBusy(true);
       }
 
       if (m.type === "modTree") {

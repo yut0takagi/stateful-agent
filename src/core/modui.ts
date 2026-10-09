@@ -151,6 +151,23 @@ export function treeOf(response: unknown): UiElement | null {
   return tree.type === "engine" ? null : tree;
 }
 
+/**
+ * mod が $.prompt.submit() で積んだプロンプトから、mod が書いた本文を取り出す。
+ *
+ * CLI はモデルに渡す前に、本文を次の文面で包む（2.1.295 で実測）。
+ *
+ *   The push-gate plugin sent a message:
+ *   <本文>
+ *
+ *   This is how Claude Code surfaces a prompt a plugin submits between turns — …
+ *
+ * 文面が変わって当てはまらなければ、包みごと返す（本文を落とすより、余計に見せるほうがよい）。
+ */
+export function unwrapPluginPrompt(text: string): string {
+  const m = /^The .+? plugin sent a message:\n([\s\S]*?)\n\nThis is how Claude Code surfaces a prompt a plugin submits/.exec(text);
+  return m?.[1] ?? text;
+}
+
 /** Text の children を 1 本の文字列にする。JSX の式は文字列の配列で届き、空文字も混ざる。 */
 export function textOf(children: UiChild[] | undefined): string {
   return (children ?? []).map((c) => (typeof c === "string" ? c : textOf(c.children))).join("");

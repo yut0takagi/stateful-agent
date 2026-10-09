@@ -31,7 +31,9 @@ export type HostMessage =
   | { type: "done" }
   | { type: "queued"; count: number; items: string[] }
   | { type: "userEcho"; text: string }
-  // mod の画面要素。CLI が生きているターン中だけ届き、止まったら modClear で消す
+  /** 人の指示なしに CLI がターンを始めた（mod の $.prompt.submit など）。from は送り主、text はその本文。 */
+  | { type: "turnStart"; from: string | null; text: string | null }
+  // mod の画面要素。CLI が生きている間（次の指示まで）届き、止まったら modClear で消す
   | { type: "modTree"; site: "band" | "pane"; id: string; tree: UiElement | null }
   | { type: "modPanes"; panes: UiPane[]; shownId: string | null }
   | { type: "modStatus"; plugin: string; text: string | null }
