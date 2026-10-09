@@ -23,9 +23,11 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import * as vscode from "vscode";
 import { run, type Turn } from "./core/agent.js";
+import { ModSurface, type ModSurfaceEvent } from "./core/modsurface.js";
 import {
   applyEdit,
   INITIAL_STATE,
@@ -72,6 +74,14 @@ let sessionId: string | undefined;
 
 /** ツール呼び出し id → 表示用の情報。結果が返ったときに紐づける。 */
 const toolCards = new Map<string, { name: string }>();
+
+/**
+ * いまのターンの CLI につながった mod の画面要素。CLI が止まったら undefined。
+ * 押されたボタンはここに渡す。前のターンの接続から遅れて届いたものはこれと比べて捨てる。
+ */
+let modSurface: ModSurface | undefined;
+/** CLI が画面要素を断った旨は 1 度だけ出す。毎ターン出すとうるさい。 */
+let modUnavailableShown = false;
 
 function workspaceRoot(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -403,6 +413,53 @@ function html(webview: vscode.Webview, bundle = "webview"): string {
 </body></html>`;
 }
 
+// ---------- mod の画面要素 ----------
+
+/** 設定の CLI の場所。空なら SDK に同梱の CLI を使う。先頭の ~/ はホームに直す。 */
+function claudeExecutable(): string | undefined {
+  const p = config("claudeExecutable", "").trim();
+  if (p === "") {
+    return undefined;
+  }
+  return p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+}
+
+/** ModSurface のイベントを Webview のメッセージに直す。 */
+function forwardModEvent(surface: ModSurface, e: ModSurfaceEvent): void {
+  if (modSurface !== surface) {
+    return;
+  }
+  switch (e.kind) {
+    case "tree":
+      post({ type: "modTree", site: e.site, id: e.id, tree: e.tree });
+      return;
+    case "notice": {
+      const n = e.notice;
+      if (n.kind === "toast") post({ type: "modToast", plugin: n.plugin, text: n.text, timeoutMs: n.timeoutMs });
+      if (n.kind === "status") post({ type: "modStatus", plugin: n.plugin, text: n.text });
+      if (n.kind === "panes") post({ type: "modPanes", panes: n.panes, shownId: n.shownId });
+      // ターミナルでは会話の流れに薄く出る 1 行。モデルには送られない
+      if (n.kind === "log") post({ type: "rule", mark: "·", text: `${n.plugin}: ${n.text}` });
+      return;
+    }
+    case "unavailable":
+      if (!modUnavailableShown) {
+        modUnavailableShown = true;
+        post({
+          type: "meta",
+          text: `mod の画面要素は使えない（${e.reason}）。statefulAgent.claudeExecutable で新しい CLI を指せる`,
+        });
+      }
+      return;
+    case "closed":
+      modSurface = undefined;
+      post({ type: "modClear" });
+      return;
+    case "attached":
+      return;
+  }
+}
+
 // ---------- 1ターン実行 ----------
 
 async function handleSend(text: string): Promise<void> {
@@ -427,8 +484,16 @@ async function handleSend(text: string): Promise<void> {
   const controller = new AbortController();
   running = controller;
 
+  // CLI はこのターンのあいだだけ生きるので、画面要素の接続もターンごとに作る。
+  // 前のターンの残り（ステータス行など）は、新しい CLI が描き直す前に消しておく
+  post({ type: "modClear" });
+  const surface: ModSurface = new ModSurface({ onEvent: (e) => forwardModEvent(surface, e) });
+  modSurface = surface;
+
   try {
     const result = await run({
+      spawnClaudeCodeProcess: surface.spawn,
+      pathToClaudeCodeExecutable: claudeExecutable(),
       state,
       instruction: text,
       mode,
@@ -592,6 +657,22 @@ async function handleWebviewMessage(m: Record<string, unknown>): Promise<void> {
                 // 保存しない。編集中の内容は Webview 側に残す。
                 post({ type: "editError", text: result.message });
               }
+            }
+          }
+          if (m.type === "modPress" && typeof m.plugin === "string" && typeof m.handle === "number") {
+            // 人が Webview のボタンを押したときだけここに来る。push-gate の承認のように
+            // 「人が押した」ことが前提の mod があるので、ほかの経路から ui_press を送らない
+            if (!modSurface) {
+              post({ type: "rule", mark: "○", text: "このボタンはもう押せない（ターンが終わり CLI が止まった）" });
+              return;
+            }
+            const pressed = await modSurface.press({
+              plugin: m.plugin,
+              handle: m.handle,
+              ...(typeof m.key === "string" ? { key: m.key } : {}),
+            });
+            if (!pressed) {
+              post({ type: "rule", mark: "○", text: "ボタンを押せなかった。描き直したので、もう一度押してほしい" });
             }
           }
           if (m.type === "stop") {

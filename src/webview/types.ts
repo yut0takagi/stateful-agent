@@ -6,6 +6,7 @@
  */
 
 import type { ToolCard } from "../core/toolview.js";
+import type { UiElement, UiPane } from "../core/modui.js";
 
 export type HistoryMode = "stateless" | "recent" | "full";
 
@@ -29,7 +30,13 @@ export type HostMessage =
   | { type: "mode"; mode: HistoryMode }
   | { type: "done" }
   | { type: "queued"; count: number; items: string[] }
-  | { type: "userEcho"; text: string };
+  | { type: "userEcho"; text: string }
+  // mod の画面要素。CLI が生きているターン中だけ届き、止まったら modClear で消す
+  | { type: "modTree"; site: "band" | "pane"; id: string; tree: UiElement | null }
+  | { type: "modPanes"; panes: UiPane[]; shownId: string | null }
+  | { type: "modStatus"; plugin: string; text: string | null }
+  | { type: "modToast"; plugin: string; text: string; timeoutMs: number }
+  | { type: "modClear" };
 
 /** Webview → 拡張 */
 export type ClientMessage =
@@ -38,4 +45,6 @@ export type ClientMessage =
   | { type: "edit" }
   | { type: "save"; text: string }
   | { type: "reset" }
-  | { type: "stop" };
+  | { type: "stop" }
+  /** 人が mod のボタンを押した。これ以外の経路で ui_press を送らない。 */
+  | { type: "modPress"; plugin: string; handle: number; key?: string };
