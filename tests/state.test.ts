@@ -5,6 +5,7 @@ import {
   dedupeIds,
   buildPrompt,
   extractPatch,
+  INITIAL_STATE,
   isEmpty,
   parseState,
   renderState,
@@ -443,9 +444,9 @@ describe("validatePatch — 部分更新にも効く", () => {
     expect(w.join("\n")).toMatch(/前提/);
   });
 
-  it("「決定~」も検証対象", () => {
+  it("「決定~」も検証対象（部分更新なので、id で名指ししているかを見る）", () => {
     const w = validatePatch({ "決定~": [{ 何を: "x", 行動: "z" }] });
-    expect(w.join("\n")).toMatch(/前提/);
+    expect(w.join("\n")).toMatch(/id で名指し/);
   });
 
   it("部分更新があれば「決定がない」とは言わない", () => {
@@ -597,5 +598,85 @@ describe("dedupeIds — 既に重複している state を直す", () => {
   it("配列でないキーは無視する", () => {
     const s: AgentState = { schema_version: 1, active: false, 目的: "文字列" };
     expect(() => dedupeIds(s)).not.toThrow();
+  });
+});
+
+describe("決定と未決の載せ方（段階表示）", () => {
+  const decided = (n: number) => ({ id: `D${n}`, 何を: `決定${n}`, 前提: [`前提${n}`], 行動: `行動${n}`, 状態: "確定" });
+
+  it("決定と未決の中身をプロンプトに載せる（[object Object] にしない）", () => {
+    const p = buildPrompt(
+      { schema_version: 1, active: true, 決定: [decided(1)], 未決: [{ id: "Q1", 論点: "いつ押すか", 要る情報: "人の判断" }] },
+      "続けて",
+    );
+    expect(p).not.toContain("[object Object]");
+    expect(p).toContain("D1 [確定] 決定1");
+    expect(p).toContain("前提: 前提1");
+    expect(p).toContain("Q1 いつ押すか（要る情報: 人の判断）");
+    expect(p).toContain('"決定+": [{ "id": "D2"');
+  });
+
+  it("古い確定は 1 行、直近と判断モデルが選んだものは詳しく", () => {
+    const state: AgentState = { schema_version: 1, active: true, 決定: [1, 2, 3, 4, 5, 6, 7].map(decided) };
+    const p = buildPrompt(state, "x", [], { focus: ["D1"] });
+    expect(p).toContain("前提: 前提1"); // focus
+    expect(p).not.toContain("前提: 前提2"); // 1 行
+    expect(p).toContain("    - D2 [確定] 決定2");
+    expect(p).toContain("前提: 前提7"); // 直近
+  });
+
+  it("退避した id はプロンプトにも STATE の手編集にも出さない", () => {
+    const state: AgentState = { schema_version: 1, active: true, archived_ids: ["D1"], 決定: [decided(2)] };
+    expect(buildPrompt(state, "x")).not.toContain("archived_ids");
+    expect(toEditable(state)).not.toContain("archived_ids");
+  });
+});
+
+describe("applyPatch: 未決の id と退避した id", () => {
+  it("id のない未決に Q を振る。未決~ で解決にできる", () => {
+    const s1 = applyPatch(INITIAL_STATE, { "未決+": [{ 論点: "a" }, { 論点: "b" }] });
+    expect(s1["未決"]).toEqual([
+      { id: "Q1", 論点: "a" },
+      { id: "Q2", 論点: "b" },
+    ]);
+    const s2 = applyPatch(s1, { "未決~": [{ id: "Q1", 論点: "a", 状態: "解決" }] });
+    expect((s2["未決"] as { 状態?: string }[])[0]?.状態).toBe("解決");
+  });
+
+  it("決定+ の id が退避した id と重なったら振り直す", () => {
+    const s = applyPatch({ ...INITIAL_STATE, archived_ids: ["D1", "D1-2"] }, { "決定+": [{ id: "D1", 何を: "新しい" }] });
+    expect((s["決定"] as { id: string }[])[0]?.id).toBe("D1-3");
+  });
+
+  it("決定~ で退避した id を名指ししたら、その id のまま足す（書き直し）", () => {
+    const s = applyPatch({ ...INITIAL_STATE, archived_ids: ["D1"] }, { "決定~": [{ id: "D1", 何を: "撤回する", 状態: "撤回" }] });
+    expect((s["決定"] as { id: string }[])[0]?.id).toBe("D1");
+  });
+});
+
+describe("applyEdit: 退避した id を残す", () => {
+  it("手編集で全置換しても archived_ids は消えない", () => {
+    const r = applyEdit({ ...INITIAL_STATE, archived_ids: ["D1"] }, '{ "目的": "x" }');
+    expect(r.ok && r.state.archived_ids).toEqual(["D1"]);
+  });
+});
+
+describe("~ は書いた項目だけを書き換える", () => {
+  it("決定~ で状態だけ変えても、何を・前提は残る", () => {
+    const s0 = applyPatch(INITIAL_STATE, { "決定+": [{ id: "D1", 何を: "A", 前提: ["p"], 行動: "x", 状態: "確定" }] });
+    const s1 = applyPatch(s0, { "決定~": [{ id: "D1", 状態: "撤回" }] });
+    expect(s1["決定"]).toEqual([{ id: "D1", 何を: "A", 前提: ["p"], 行動: "x", 状態: "撤回" }]);
+  });
+
+  it("未決~ で解決にしても、論点は残る", () => {
+    const s0 = applyPatch(INITIAL_STATE, { "未決+": [{ 論点: "いつ出すか", 要る情報: "人の判断" }] });
+    const s1 = applyPatch(s0, { "未決~": [{ id: "Q1", 状態: "解決", 解決: "D2 で決めた" }] });
+    expect(s1["未決"]).toEqual([{ id: "Q1", 論点: "いつ出すか", 要る情報: "人の判断", 状態: "解決", 解決: "D2 で決めた" }]);
+  });
+
+  it("部分更新は、新しく足すときの項目を求めない（id だけ求める）", () => {
+    const base = { "決定+": [{ id: "D2", 何を: "B", 前提: ["p"], 行動: "y", 状態: "確定" }] };
+    expect(validatePatch({ ...base, "決定~": [{ id: "D1", 状態: "撤回" }], "未決~": [{ id: "Q1", 状態: "解決" }] })).toEqual([]);
+    expect(validatePatch({ ...base, "未決~": [{ 状態: "解決" }] })).toEqual(["未決[0]: 「未決~」は id で名指しすること"]);
   });
 });

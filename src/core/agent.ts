@@ -18,6 +18,7 @@ import {
   validatePatch,
   type AgentState,
   type HistoryMode,
+  type PromptView,
 } from "./state.js";
 import { ContextBudget } from "./contextbudget.js";
 import { DELEGATE_HINT, toAgentsOption } from "./explorer.js";
@@ -68,6 +69,8 @@ export interface RunOptions extends TurnHandlers {
    * 省略すると全層なしで従来どおり動く。ターンごとに作り直す。
    */
   budget?: ContextBudget;
+  /** state をプロンプトに載せるときの見せ方（判断モデルが選んだ決定など）。省略すると規則だけで決める。 */
+  view?: PromptView;
   /** CLI の起動を差し替える。mod の画面要素をつなぐときに使う（modsurface.ts）。 */
   spawnClaudeCodeProcess?: SdkOptions["spawnClaudeCodeProcess"];
   /** 使う CLI の場所。省略すると SDK に同梱の CLI を使う。 */
@@ -171,7 +174,7 @@ export const STATE_PROTOCOL = [
   '      "状態": "確定"',
   "    }",
   "  ],",
-  '  "未決": [{ "論点": "決まっていないこと", "要る情報": "決めるために必要なもの" }],',
+  '  "未決": [{ "id": "Q1", "論点": "決まっていないこと", "要る情報": "決めるために必要なもの" }],',
   '  "次の一手": "引き継いだ側が最初にやること"',
   "}",
   "```",
@@ -222,7 +225,20 @@ export const STATE_PROTOCOL = [
   "```",
   "",
   "同じ規約が `未決+` `未決~` にも使える。",
+  "未決が片づいたら、`未決~` で id を名指しし、状態を「解決」にする。解決した未決は state から外れる（記録は残る）。",
+  "",
+  '```state',
+  '{ "未決~": [{ "id": "Q3", "状態": "解決", "解決": "D9 で決めた" }] }',
+  '```',
+  "",
   "`目的` や `次の一手` のような単一の値は、これまでどおりキーごと上書きする。",
+  "",
+  "## state の見え方",
+  "",
+  "- state の決定は、詳しく載るものと「D3 [確定] 何を」の 1 行のものがある。1 行のものも有効な決定で、依存にその id を書いてよい",
+  "- 古い確定・撤回の決定は、別のファイルに退避されてプロンプトから外れる。消えたわけではなく、グラフには残る",
+  "- 新しい決定の id は、state に書かれた「新しい決定の id は … から振る」に従う",
+  "- 「前提」「却下」は 1 項目 1 文で、3 項目までにする。長く書くほど、次のターンの自分が読む量が増える",
   "",
   "- 値に `null` を書くとそのキーは削除される",
   "- 作業が進んだ・何かを判断した・次にやることが変わった、のいずれかがあれば必ず出す",
@@ -493,7 +509,7 @@ export function preparePrompt(opts: RunOptions): { prompt: string; isolating: bo
   // agents を定義しただけでは使われない。
   const isolating = opts.budget?.planIsolation(opts.instruction) ?? false;
   const prompt =
-    buildPrompt(opts.state, opts.instruction, recent) + (isolating ? DELEGATE_HINT : "");
+    buildPrompt(opts.state, opts.instruction, recent, opts.view) + (isolating ? DELEGATE_HINT : "");
   return { prompt, isolating };
 }
 

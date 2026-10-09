@@ -148,6 +148,26 @@
           "default": 40000,
           "description": "[3] 1ターンのツール出力合計の上限（文字）。超えると以降を強く絞る"
         },
+        "statefulAgent.judge.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "判断モデルの接続先。TypeSafe の /v1/systemone と同じ形で答えるもの（例: ローカルの Ollaya は http://localhost:11435、Jev は https://api.typesafe.ai）。設定すると、今回の指示に関係する決定を選ばせ、プロンプトに詳しく載せる。空なら使わず、依存のつながりの規則だけで載せる。Jev の API キーは環境変数 TYPESAFE_API_KEY で渡す"
+        },
+        "statefulAgent.judge.model": {
+          "type": "string",
+          "default": "laya:multilingual",
+          "description": "判断モデルの名前。Ollaya の laya:multilingual が日本語の決定を見分けられた。laya（言語で振り分け）は日本語の state でも英語版に回り、どの決定も 0.6 前後になって選別できなかった（実測）"
+        },
+        "statefulAgent.judge.threshold": {
+          "type": "number",
+          "default": 0.8,
+          "description": "判断モデルが返す確率がこれ以上の決定を、今回の指示に関係するとみなす。0.5 では関係の薄い決定も多く入った（実測）"
+        },
+        "statefulAgent.judge.timeoutMs": {
+          "type": "number",
+          "default": 2000,
+          "description": "判断モデルの答えを待つ時間（ミリ秒）。過ぎたら規則だけで state を載せる"
+        },
         "statefulAgent.claudeExecutable": {
           "type": "string",
           "default": "",

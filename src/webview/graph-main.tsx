@@ -13,6 +13,9 @@ import { GraphView } from "./ui/graph-view.js";
 import type { GraphEdge, RenderNode } from "../core/graph.js";
 import "./styles.css";
 
+declare function acquireVsCodeApi(): { postMessage(m: unknown): void };
+const vscode = acquireVsCodeApi();
+
 interface GraphMessage {
   type: "graph";
   nodes: RenderNode[];
@@ -32,6 +35,8 @@ function GraphApp() {
       }
     };
     window.addEventListener("message", onMessage);
+    // 受け取る準備ができてから描くものを頼む。先に送られた分は捨てられ、グラフが空のままになっていた
+    vscode.postMessage({ type: "ready" });
     return () => window.removeEventListener("message", onMessage);
   }, []);
 

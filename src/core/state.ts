@@ -9,8 +9,20 @@
  * VSCode API に依存させない（テスト可能にするため）。ファイル I/O は呼び出し側が渡す。
  */
 
+import {
+  ARCHIVED_IDS_KEY,
+  archivedIdsOf,
+  assignOpenIds,
+  decisionsOf,
+  DEFAULT_LEDGER_LIMITS,
+  nextDecisionId,
+  renderDecisions,
+  renderOpen,
+  summarizeItem,
+} from "./ledger.js";
+
 /** 制御用のキー。プロンプトには載せない。 */
-const CONTROL_KEYS = new Set(["schema_version", "active", "history_mode"]);
+const CONTROL_KEYS = new Set(["schema_version", "active", "history_mode", ARCHIVED_IDS_KEY]);
 
 export type HistoryMode = "stateless" | "recent" | "full";
 
@@ -80,11 +92,15 @@ export function applyPatch(state: AgentState, patch: Record<string, unknown>): A
     // （実測: out 12,799 / state 5,404 バイト）、変わった分だけ出せるようにする。
     const op = parseArrayOp(key);
     if (op !== null && Array.isArray(value)) {
-      next[op.key] = mergeArray(next[op.key], value, op.mode);
+      next[op.key] = mergeArray(next[op.key], value, op.mode, archivedIdsOf(state));
       continue;
     }
 
     next[key] = value;
+  }
+  // 未決に id を振る。id がないと「未決~」で解決にできず、増える一方になる
+  if (Array.isArray(next["未決"])) {
+    next["未決"] = assignOpenIds(next["未決"] as unknown[], archivedIdsOf(next));
   }
   return next;
 }
@@ -105,11 +121,14 @@ function parseArrayOp(key: string): { key: string; mode: "append" | "update" } |
  *
  * update で id が見つからないときは追記する。取りこぼすより残すほうがよい
  * （モデルが id を書き間違えても、書いた内容自体は失われない）。
+ * archived は退避した id。追記がこれと重なったら振り直す。update で名指しされたら、
+ * 退避した決定の書き直しとしてその id のまま足す（グラフは current を正とする）。
  */
 function mergeArray(
   current: unknown,
   incoming: unknown[],
   mode: "append" | "update",
+  archived: string[] = [],
 ): unknown[] {
   // 壊れた state から復帰できるよう、配列でなければ作り直す。
   const base = Array.isArray(current) ? [...current] : [];
@@ -118,13 +137,17 @@ function mergeArray(
     const id = idOf(item);
     const at = mode === "update" && id !== null ? base.findIndex((x) => idOf(x) === id) : -1;
     if (at >= 0) {
-      base[at] = item;
+      // 書いた項目だけを書き換える。{ id, 状態: "撤回" } のような部分更新で、
+      // 何を・論点などが消えないように（消えるとグラフから節点が落ち、退避した記録も欠ける）
+      const old = base[at];
+      base[at] = isRecord(old) && isRecord(item) ? { ...old, ...item } : item;
       continue;
     }
     // 追記で id が衝突したら振り直す。履歴を持たないモデルは
     // セッションが変わると D1 から採番し直すので、実際に重複が起きる
     // （実測: D6 と D7 が別内容で2件ずつ存在した）。
-    base.push(id !== null && hasId(base, id) ? withUniqueId(item, base, id) : item);
+    const taken = id !== null && (hasId(base, id) || (mode === "append" && archived.includes(id)));
+    base.push(taken ? withUniqueId(item, base, id, archived) : item);
   }
   return base;
 }
@@ -143,9 +166,10 @@ function withUniqueId(
   item: unknown,
   list: unknown[],
   original: string,
+  archived: string[] = [],
 ): Record<string, unknown> {
   let n = 2;
-  while (hasId(list, `${original}-${n}`)) {
+  while (hasId(list, `${original}-${n}`) || archived.includes(`${original}-${n}`)) {
     n += 1;
   }
   return { ...(item as Record<string, unknown>), id: `${original}-${n}` };
@@ -182,22 +206,53 @@ export function extractPatch(responseText: string): Record<string, unknown> | nu
   }
 }
 
-/** state を Markdown に整形する。空の項目と制御キーは落とす。 */
-export function renderState(state: AgentState): string | null {
+/** プロンプトに state を載せるときの見せ方。省略すると規則だけで決める。 */
+export interface PromptView {
+  /** 詳しく載せる決定の id（判断モデルが今回の指示に関係すると見たもの）。 */
+  focus?: string[];
+  /** 退避した決定のうち、今回の指示に関係するもの。 */
+  recalled?: Record<string, unknown>[];
+}
+
+/**
+ * state を Markdown に整形する。空の項目と制御キーは落とす。
+ *
+ * 決定は ledger.ts の段階表示にする（詳しく載せるものと 1 行のもの）。
+ * 配列の中のオブジェクトは「キー: 値」の 1 行にする。String() にすると [object Object] になり、
+ * モデルに中身が見えなかった。
+ */
+export function renderState(state: AgentState, view: PromptView = {}): string | null {
   const lines: string[] = [];
   for (const [key, value] of Object.entries(state)) {
+    if (key === "決定") {
+      lines.push(
+        ...renderDecisions(decisionsOf(state), {
+          recent: DEFAULT_LEDGER_LIMITS.recent,
+          detail: DEFAULT_LEDGER_LIMITS.detail,
+          focus: view.focus,
+          recalled: view.recalled,
+          archivedCount: archivedIdsOf(state).filter((id) => /^D/.test(id)).length,
+          nextId: nextDecisionId(state),
+        }),
+      );
+      continue;
+    }
     if (CONTROL_KEYS.has(key) || isEmpty(value)) {
+      continue;
+    }
+    if (key === "未決" && Array.isArray(value)) {
+      lines.push(...renderOpen(value, DEFAULT_LEDGER_LIMITS.openDetail));
       continue;
     }
     if (Array.isArray(value)) {
       lines.push(`- **${key}**:`);
       for (const item of value) {
-        lines.push(`    - ${String(item)}`);
+        lines.push(`    - ${summarizeItem(key, item)}`);
       }
     } else if (typeof value === "object") {
       lines.push(`- **${key}**:`);
       for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-        lines.push(`    - ${k}: ${String(v)}`);
+        lines.push(`    - ${k}: ${summarizeItem(k, v)}`);
       }
     } else {
       lines.push(`- **${key}**: ${String(value)}`);
@@ -217,10 +272,11 @@ export function buildPrompt(
   state: AgentState,
   instruction: string,
   recentTurns: string[] = [],
+  view: PromptView = {},
 ): string {
   const sections: string[] = [];
 
-  const rendered = renderState(state);
+  const rendered = renderState(state, view);
   if (rendered) {
     sections.push(
       [
@@ -246,9 +302,10 @@ export function buildPrompt(
       "## state の更新",
       "",
       "応答の最後にパッチを出す。引き継ぎ書として書くこと（規約はシステム側に記載）。",
+      "既存の決定は書き直さず、新しい決定は `決定+` で足す（`決定` で全置換すると、1 行で見えている決定も消える）。",
       "",
       "```state",
-      '{ "決定": [{ "何を": "...", "前提": ["..."], "行動": "...", "状態": "確定" }] }',
+      `{ "決定+": [{ "id": "${nextDecisionId(state)}", "何を": "...", "前提": ["..."], "行動": "...", "状態": "確定" }] }`,
       "```",
     ].join("\n"),
   );
@@ -299,11 +356,13 @@ export function applyEdit(state: AgentState, raw: string): EditResult {
   }
 
   // 制御キーは現在の値を残す。編集側に書かれていても無視する。
-  const next: AgentState = {
-    schema_version: state.schema_version,
-    active: state.active,
-    ...(state.history_mode ? { history_mode: state.history_mode } : {}),
-  };
+  // 退避した id（archived_ids）も残す。消えると、新しい id が退避分と重なる
+  const next: AgentState = { schema_version: state.schema_version, active: state.active };
+  for (const key of CONTROL_KEYS) {
+    if (key in state && !(key in next)) {
+      next[key] = state[key];
+    }
+  }
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
     if (!CONTROL_KEYS.has(key)) {
       next[key] = value;
@@ -401,10 +460,22 @@ export function validatePatch(patch: Record<string, unknown>): string[] {
     return warnings;
   }
 
+  // 決定~ は部分更新（書いた項目だけを書き換える）。名指しの id と状態の語彙だけを見る
+  const decisionUpdates = new Set(Array.isArray(patch["決定~"]) ? patch["決定~"] : []);
   decisions.forEach((d, i) => {
     const label = `決定[${i}]`;
     if (!isRecord(d)) {
       warnings.push(`${label}: オブジェクトにすること`);
+      return;
+    }
+    const st0 = d["状態"];
+    if (decisionUpdates.has(d)) {
+      if (isEmpty(d["id"])) {
+        warnings.push(`${label}: 「決定~」は id で名指しすること`);
+      }
+      if (st0 !== undefined && !DECISION_STATES.includes(st0 as (typeof DECISION_STATES)[number])) {
+        warnings.push(`${label}: 「状態」は ${DECISION_STATES.join(" / ")} のいずれか`);
+      }
       return;
     }
     for (const key of DECISION_REQUIRED) {
@@ -424,9 +495,18 @@ export function validatePatch(patch: Record<string, unknown>): string[] {
   });
 
   const open = collectEntries(patch, "未決");
+  // 未決~ は部分更新（解決にするなど）。論点は要らず、id で名指しする
+  const openUpdates = new Set(Array.isArray(patch["未決~"]) ? patch["未決~"] : []);
   if (Array.isArray(open)) {
     open.forEach((o, i) => {
-      if (isRecord(o) && isEmpty(o["論点"])) {
+      if (!isRecord(o)) {
+        return;
+      }
+      if (openUpdates.has(o)) {
+        if (isEmpty(o["id"])) {
+          warnings.push(`未決[${i}]: 「未決~」は id で名指しすること`);
+        }
+      } else if (isEmpty(o["論点"])) {
         warnings.push(`未決[${i}]: 「論点」がない（何が決まっていないのかを書くこと）`);
       }
     });
