@@ -9,6 +9,7 @@
 import { useEffect, useRef, useState } from "react";
 import { RotateCcw } from "lucide-react";
 import { ChatMessage, TypingIndicator } from "./ui/message.js";
+import { MarkdownRenderer } from "./ui/markdown.js";
 import { ToolCardView } from "./ui/tool-card.js";
 import { StatePanel } from "./ui/state-panel.js";
 import { Composer } from "./ui/composer.js";
@@ -26,7 +27,9 @@ const send = (m: ClientMessage): void => vscode.postMessage(m);
 type Item =
   | { kind: "msg"; id: number; isUser: boolean; text: string; streaming: boolean }
   | { kind: "tool"; id: string; card: ToolCard; result?: { isError: boolean; output?: { lines: string[]; truncated: boolean; omitted: number } } }
-  | { kind: "note"; id: number; mark: string; text: string; level?: "warn" | "err" };
+  | { kind: "note"; id: number; mark: string; text: string; level?: "warn" | "err" }
+  /** 人の指示なしに CLI が始めたターン。送り主と、積まれたプロンプトの本文（Markdown）。 */
+  | { kind: "turn"; id: number; from: string | null; text: string | null };
 
 let seq = 0;
 
@@ -133,11 +136,7 @@ export function App() {
 
       // 人が送っていないターン。誰が何を頼んだかを残し、走っている間は送った指示を待たせる
       if (m.type === "turnStart") {
-        const head = `${m.from ?? "CLI"} が続きのターンを始めた`;
-        setItems((prev) => [
-          ...prev,
-          { kind: "note", id: ++seq, mark: "↻", text: m.text ? `${head}\n${m.text}` : head },
-        ]);
+        setItems((prev) => [...prev, { kind: "turn", id: ++seq, from: m.from, text: m.text }]);
         setBusy(true);
       }
 
@@ -185,8 +184,20 @@ export function App() {
     };
 
     window.addEventListener("message", onMessage);
+    // 受け取る準備ができてから初期表示を頼む。先に送られた分は捨てられる
+    send({ type: "ready" });
     return () => window.removeEventListener("message", onMessage);
   }, []);
+
+  // 打ち始めたら判断モデルを暖めてもらう。送るまでに読み込みが済むように。30 秒に 1 回まで
+  const lastTyping = useRef(0);
+  const onInput = (text: string): void => {
+    setInput(text);
+    if (text !== "" && Date.now() - lastTyping.current > 30_000) {
+      lastTyping.current = Date.now();
+      send({ type: "typing" });
+    }
+  };
 
   const submit = (): void => {
     const text = input.trim();
@@ -268,6 +279,18 @@ export function App() {
             />
           ) : item.kind === "tool" ? (
             <ToolCardView key={item.id} card={item.card} result={item.result} />
+          ) : item.kind === "turn" ? (
+            <div key={item.id} className="mb-3 text-[12px] text-muted-foreground">
+              <div className="flex items-start gap-2 py-1 text-[11.5px]">
+                <span className="shrink-0 opacity-85">↻</span>
+                <span>{item.from ?? "CLI"} が続きのターンを始めた</span>
+              </div>
+              {item.text && (
+                <div className="ml-5 border-l border-border pl-3">
+                  <MarkdownRenderer>{item.text}</MarkdownRenderer>
+                </div>
+              )}
+            </div>
           ) : (
             <div
               key={item.id}
@@ -301,7 +324,7 @@ export function App() {
         value={input}
         busy={busy}
         queued={queuedItems}
-        onChange={setInput}
+        onChange={onInput}
         onSubmit={submit}
         onStop={() => send({ type: "stop" })}
       />

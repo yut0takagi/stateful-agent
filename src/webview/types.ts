@@ -42,6 +42,10 @@ export type HostMessage =
 
 /** Webview → 拡張 */
 export type ClientMessage =
+  /** Webview の読み込みが終わった。拡張はこれを受けて初期表示を送る。 */
+  | { type: "ready" }
+  /** 入力欄に打ち始めた。拡張は判断モデルを読み込ませておく（間を空けて送る）。 */
+  | { type: "typing" }
   | { type: "send"; text: string }
   | { type: "mode"; mode: HistoryMode }
   | { type: "edit" }

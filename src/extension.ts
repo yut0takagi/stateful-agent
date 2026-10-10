@@ -20,6 +20,7 @@ import {
   readdirSync,
   readFileSync,
   readSync,
+  renameSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -29,6 +30,19 @@ import * as vscode from "vscode";
 import type { Turn, TurnHandlers } from "./core/agent.js";
 import { ModSurface, type ModSurfaceEvent } from "./core/modsurface.js";
 import { startSession, type AgentSession, type FollowUpStart, type TurnEnd } from "./core/session.js";
+import {
+  archivedDecisions,
+  DEFAULT_LEDGER_LIMITS,
+  decisionsOf,
+  formatArchive,
+  parseArchive,
+  planArchive,
+  selectDetailed,
+  summarizeItem,
+  withArchived,
+  type ArchiveEntry,
+} from "./core/ledger.js";
+import { judgeRelevance, warmUp } from "./core/judge.js";
 import {
   applyEdit,
   INITIAL_STATE,
@@ -40,6 +54,7 @@ import {
   toEditable,
   type AgentState,
   type HistoryMode,
+  type PromptView,
 } from "./core/state.js";
 import { buildRunRecord, formatRunLine, parseRunLog, summarize } from "./core/metrics.js";
 import { buildGraph, layoutGraph, toRenderModel } from "./core/graph.js";
@@ -116,10 +131,108 @@ function loadState(root: string): AgentState {
   return dedupeIds(parseState(readFileSync(p, "utf8")));
 }
 
-function saveState(root: string, state: AgentState): void {
+/** 退避した決定と未決の置き場所。state の隣に置く。 */
+function archivePath(root: string): string {
+  return join(dirname(statePath(root)), "archive.jsonl");
+}
+
+function loadArchive(root: string): ArchiveEntry[] {
+  try {
+    return parseArchive(readFileSync(archivePath(root), "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * state を保存する。保存した state を返す。
+ *
+ * 保存する前に退避をかける（ledger.ts の planArchive）。決定が上限を超えたら古い確定・撤回を、
+ * 解決した未決はすぐ、archive.jsonl に移す。state を有界に保ち、プロンプトに載る量を抑えるため。
+ * 退避分は追記だけで、書き換えない。
+ */
+function saveState(root: string, state: AgentState): AgentState {
   const p = statePath(root);
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, serializeState(state), "utf8");
+  const { state: kept, archived } = planArchive(state, DEFAULT_LEDGER_LIMITS, new Date());
+  if (archived.length > 0) {
+    appendFileSync(archivePath(root), formatArchive(archived), "utf8");
+  }
+  writeFileSync(p, serializeState(kept), "utf8");
+  return kept;
+}
+
+/**
+ * state を空に戻す。退避ファイルは消さずに、日時付きの名前に変えて脇に置く。
+ * 残したままだと、新しい state のグラフに前の作業の決定が混ざり、id も重なる。
+ */
+function resetState(root: string): void {
+  const archive = archivePath(root);
+  if (existsSync(archive)) {
+    renameSync(archive, archive.replace(/\.jsonl$/, `.${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`));
+  }
+  saveState(root, { ...INITIAL_STATE });
+  postGraph({ ...INITIAL_STATE });
+}
+
+/** 最後に暖機を頼んだ時刻。打つたびに投げないよう、間を空ける。 */
+let lastWarm = 0;
+
+/** 判断モデルを読み込ませておく（judge.ts の warmUp）。入力欄に打ち始めたときと、パネルを開いたときに呼ぶ。 */
+function warmJudge(): void {
+  const baseUrl = config("judge.baseUrl", "").trim();
+  if (baseUrl === "" || Date.now() - lastWarm < 60_000) {
+    return;
+  }
+  lastWarm = Date.now();
+  void warmUp({ baseUrl, model: config("judge.model", "laya:multilingual") });
+}
+
+/** 判断モデルを呼べなかったことを、続けて何度も出さない。呼べたら戻す。 */
+let judgeDownShown = false;
+
+/**
+ * 判断モデルに、今回の指示に関係する決定を選ばせる（judge.ts）。設定がなければ規則だけで載せる。
+ *
+ * 候補は、規則では 1 行になる決定と、退避した決定。関係すると見たものを詳しく載せる。
+ */
+async function planPromptView(root: string, state: AgentState, instruction: string): Promise<PromptView> {
+  const baseUrl = config("judge.baseUrl", "").trim();
+  if (baseUrl === "") {
+    return {};
+  }
+  const current = decisionsOf(state);
+  const detailed = selectDetailed(current, DEFAULT_LEDGER_LIMITS.recent, [], DEFAULT_LEDGER_LIMITS.detail);
+  const brief = current.filter((_, i) => !detailed.has(i));
+  const live = new Set(current.map((d) => d.id));
+  const archived = archivedDecisions(loadArchive(root)).filter((d) => !live.has(d.id));
+  const result = await judgeRelevance(
+    {
+      baseUrl,
+      model: config("judge.model", "laya:multilingual"),
+      apiKey: process.env.TYPESAFE_API_KEY,
+      threshold: config("judge.threshold", 0.8),
+      timeoutMs: config("judge.timeoutMs", 2000),
+    },
+    instruction,
+    [...archived, ...brief],
+  );
+  if (result.error !== undefined) {
+    if (!judgeDownShown) {
+      judgeDownShown = true;
+      post({ type: "meta", text: `判断モデル（${baseUrl}）を呼べなかった（${result.error}）。規則だけで state を載せる` });
+    }
+    return {};
+  }
+  judgeDownShown = false;
+  const picked = new Set(result.ids);
+  const focus = brief.map((d) => String(d.id)).filter((id) => picked.has(id));
+  const recalled = archived.filter((d) => picked.has(String(d.id)));
+  if (focus.length + recalled.length > 0) {
+    const ids = [...focus, ...recalled.map((d) => String(d.id))];
+    post({ type: "rule", mark: "◇", text: `判断モデルが関係すると見た決定を詳しく載せる: ${ids.join(", ")}` });
+  }
+  return { focus, recalled };
 }
 
 /** グラフビューに現在の state を送る。開いていなければ何もしない。 */
@@ -127,9 +240,12 @@ function postGraph(state: AgentState): void {
   if (!graphPanel) {
     return;
   }
+  // 退避した決定も描く。グラフは決定と依存の全体を見せるもので、プロンプトの都合で欠けてはいけない
+  const root = workspaceRoot();
+  const whole = root ? withArchived(state, loadArchive(root)) : state;
   // postMessage は構造化クローンなので Class のメソッドは渡らない。
   // ドメインは拡張側に留め、訳し終えた描画指示だけを送る。
-  const model = toRenderModel(layoutGraph(buildGraph(state)));
+  const model = toRenderModel(layoutGraph(buildGraph(whole)));
   void graphPanel.webview.postMessage({ type: "graph", ...model });
 }
 
@@ -365,15 +481,17 @@ function stateRows(state: AgentState): Array<{ key?: string; value: string; sub?
   for (const [key, value] of Object.entries(state)) {
     if (key === "schema_version" || key === "active" || key === "history_mode") continue;
     if (value === null || value === undefined || value === "" || value === false) continue;
+    if (key === "archived_ids") continue;
     if (Array.isArray(value)) {
       if (value.length === 0) continue;
       rows.push({ key, value: "" });
-      for (const item of value) rows.push({ value: String(item), sub: true });
+      // 決定は「D3 [確定] 何を」、未決は「Q2 論点（要る情報: …）」の 1 行にする
+      for (const item of value) rows.push({ value: summarizeItem(key, item), sub: true });
     } else if (typeof value === "object") {
       const entries = Object.entries(value as Record<string, unknown>);
       if (entries.length === 0) continue;
       rows.push({ key, value: "" });
-      for (const [k, v] of entries) rows.push({ value: `${k}: ${String(v)}`, sub: true });
+      for (const [k, v] of entries) rows.push({ value: `${k}: ${summarizeItem(k, v)}`, sub: true });
     } else {
       rows.push({ key, value: String(value) });
     }
@@ -574,9 +692,9 @@ function finishTurn(turn: TurnContext, controller: AbortController, end: TurnEnd
 
     const patched = result.statePatched;
     if (patched) {
-      saveState(root, result.state);
-      post({ type: "state", rows: stateRows(result.state) });
-      postGraph(result.state);
+      const saved = saveState(root, result.state);
+      post({ type: "state", rows: stateRows(saved) });
+      postGraph(saved);
     }
 
     // 引き継ぎ書として足りない点を見せる。保存は済んでいるので作業は止めない。
@@ -666,6 +784,9 @@ async function handleSend(text: string): Promise<void> {
   const controller = new AbortController();
   running = controller;
 
+  // 判断モデルを待つのは running を置いてから。待つ間に送られた指示を並行に走らせず、待ち行列に入れるため
+  const view = await planPromptView(root, state, text);
+
   const surface: ModSurface = new ModSurface({ onEvent: (e) => forwardModEvent(surface, e) });
   modSurface = surface;
 
@@ -674,6 +795,7 @@ async function handleSend(text: string): Promise<void> {
     spawnClaudeCodeProcess: surface.spawn,
     pathToClaudeCodeExecutable: claudeExecutable(),
     state,
+    view,
     instruction: text,
     mode,
     recentTurns: config("recentTurns", 3),
@@ -723,8 +845,32 @@ async function handleSend(text: string): Promise<void> {
   await s.firstTurn;
 }
 
+/**
+ * Webview の初期表示（state・履歴モード・規律の数）を送る。
+ *
+ * Webview が読み込みを終えて ready を送ってきたときに呼ぶ。パネルを作った直後に送ると、
+ * スクリプトが動く前で捨てられ、規律の数が「読み込み中」のままになっていた。
+ */
+function postInitial(): void {
+  const root = workspaceRoot();
+  if (root) {
+    post({ type: "state", rows: stateRows(loadState(root)) });
+    post({ type: "mode", mode: config<HistoryMode>("historyMode", "recent") });
+    post({ type: "rules", count: loadRuleSet(root).rules.length });
+  }
+  warmJudge();
+}
+
 /** Webview からのメッセージ処理。サイドバーとセンターで共有する。 */
 async function handleWebviewMessage(m: Record<string, unknown>): Promise<void> {
+          if (m.type === "ready") {
+            postInitial();
+            return;
+          }
+          if (m.type === "typing") {
+            warmJudge();
+            return;
+          }
           if (m.type === "send" && typeof m.text === "string") {
             // 走っている最中なら積むだけ。終わったら drainQueue が拾う。
             if (running) {
@@ -755,9 +901,9 @@ async function handleWebviewMessage(m: Record<string, unknown>): Promise<void> {
             if (root2) {
               const result = applyEdit(loadState(root2), m.text);
               if (result.ok) {
-                saveState(root2, result.state);
-                post({ type: "state", rows: stateRows(result.state) });
-                postGraph(result.state);
+                const saved = saveState(root2, result.state);
+                post({ type: "state", rows: stateRows(saved) });
+                postGraph(saved);
                 post({ type: "meta", text: "state を保存した" });
               } else {
                 // 保存しない。編集中の内容は Webview 側に残す。
@@ -794,7 +940,7 @@ async function handleWebviewMessage(m: Record<string, unknown>): Promise<void> {
           if (m.type === "reset") {
             const root2 = workspaceRoot();
             if (root2) {
-              saveState(root2, { ...INITIAL_STATE });
+              resetState(root2);
               history.length = 0;
               sessionId = undefined;
               closeIdleSession();
@@ -844,11 +990,13 @@ export function activate(context: vscode.ExtensionContext): void {
           localResourceRoots: [vscode.Uri.joinPath(extensionUri!, "dist")],
         };
         view.webview.html = html(view.webview, "graph");
-
-        const root = workspaceRoot();
-        if (root) {
-          postGraph(loadState(root));
-        }
+        // 描くものは Webview の ready を待って送る。サイドバーを隠すと Webview は作り直され、また ready が来る
+        view.webview.onDidReceiveMessage((m: { type?: string }) => {
+          const root = workspaceRoot();
+          if (m?.type === "ready" && root) {
+            postGraph(loadState(root));
+          }
+        });
         view.onDidDispose(() => {
           graphPanel = undefined;
         });
@@ -883,13 +1031,7 @@ export function activate(context: vscode.ExtensionContext): void {
         closeIdleSession();
       });
       centerPanel = p2;
-
-      const root = workspaceRoot();
-      if (root) {
-        post({ type: "state", rows: stateRows(loadState(root)) });
-        post({ type: "mode", mode: config<HistoryMode>("historyMode", "recent") });
-        post({ type: "rules", count: loadRuleSet(root).rules.length });
-      }
+      // 初期表示は Webview の ready を待って送る（postInitial）
     }),
     vscode.commands.registerCommand("statefulAgent.setMode", async () => {
       const picked = await vscode.window.showQuickPick(["stateless", "recent", "full"], {
@@ -929,7 +1071,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("statefulAgent.resetState", () => {
       const root = workspaceRoot();
       if (root) {
-        saveState(root, { ...INITIAL_STATE });
+        resetState(root);
         history.length = 0;
         sessionId = undefined;
         closeIdleSession();
